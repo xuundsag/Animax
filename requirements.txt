@@ -1,0 +1,7 @@
+discord.py-self==2.1.0
+playwright>=1.49,<2
+python-dotenv>=1.0,<2
+yt-dlp>=2026.8.19
+aiohttp>=3.10,<4
+rich>=13,<15
+rapidfuzz>=3,<4
