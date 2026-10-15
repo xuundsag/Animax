@@ -12,15 +12,16 @@ from .settings import settings_command
 log = logging.getLogger("animax.commands")
 
 COMMAND_HELP = {
+    "capacity": "`.capacity`: estimated local CPU/RAM/disk capacity, not a provider concurrency guarantee.",
     "download": "`.download MAL_ID dub|sub START END [resume|force]`: inclusive range, one whole MP4 each. Example: `.download 21 dub 1 10`. Force can duplicate confirmed uploads. Pending sends are still checked before any retry.",
-    "status": "`.status`: show the current or last job in one line.",
-    "cancel": "`.cancel`: stop the job; uploaded messages and saved history remain.",
-    "resume": "`.resume` or `.retry`: resume the latest job and skip uploaded episodes. Pending uploads are checked against destination history before any retry.",
+    "status": "`.status`: show active workers, queued job IDs and shared capacity.",
+    "cancel": "`.cancel [W1|JOB_ID|all]`: stop selected workers or queued jobs; history and cached videos remain. Bare cancel requires one active worker or one queued job.",
+    "resume": "`.resume [JOB_ID|all]` or `.retry`: queue interrupted/failed jobs; bare resume selects the latest inactive unfinished job. Confirmed episodes are skipped; unresolved uploads are checked. Old jobs keep their saved upload destination.",
     "history": "`.history MAL_ID`: show local delivery totals for that anime.",
     "search": "`.search QUERY`: find up to five uploaded episodes. Try `.search One piece episode 1` or `.search eisode 1 onepimse`. Searches anime.json, not the source catalog.",
     "getlist": "`.getlist`: attach anime.json only. It contains account/channel/message metadata; share carefully.",
     "reset": "`.reset` asks for confirmation before clearing local anime history, saved jobs and video cache. `.reset cancel` aborts. Existing Discord messages, settings and cooldowns stay.",
-    "refetch": "`.refetch #channel` or `.refetch CHANNEL_ID`: recover an empty/missing anime.json from your exports and ANIMAX uploads. Existing history is not overwritten.",
+    "refetch": "`.refetch [#channel|CHANNEL_ID]`: rebuild missing/empty anime.json from readable text-history channels in that channel's category, or the entire guild if uncategorized. Defaults to the log channel, then this channel. One transaction; any scan failure leaves history unchanged.",
     "settings": "`.settings` lists fields. `.settings FIELD` shows valid values. `.settings quality 1080` validates and saves a change while idle.",
     "help": "`.help [name]`: list commands or show specific syntax.",
 }
@@ -35,18 +36,15 @@ def register_commands(bot):
 
     @bot.command(name="status", ignore_extra=False)
     async def status_entry(ctx):
-        await ctx.send(bot.job.episode_text() if bot.job else "Ready. No active job.")
+        await ctx.send(bot.scheduler.status_text())
 
     @bot.command(name="cancel", ignore_extra=False)
-    async def cancel_entry(ctx):
-        if bot.worker and not bot.worker.done():
-            bot.worker.cancel()
-            await ctx.send("Cancelling. Uploaded episodes are saved.")
-        elif bot.refetch_task and not bot.refetch_task.done():
+    async def cancel_entry(ctx, selector: str = ""):
+        if bot.refetch_task and not bot.refetch_task.done():
             bot.refetch_task.cancel()
             await ctx.send("Cancelling refetch. Existing history stays unchanged.")
         else:
-            await ctx.send("No active job to cancel.")
+            await ctx.send(await bot.scheduler.cancel(selector))
 
     @bot.command(name="help", aliases=["mphelp"], ignore_extra=False)
     async def help_entry(ctx, name: str = ""):
@@ -81,27 +79,47 @@ def register_commands(bot):
 
     @bot.command(name="getlist", ignore_extra=False)
     async def getlist_entry(ctx):
-        # Atomic journal replacements leave this open file snapshot valid.
-        attachment = discord.File(str(bot.library.path), filename="anime.json")
-        try:
-            await ctx.send(file=attachment)
-        finally:
-            attachment.close()
+        async with bot.scheduler.resources.lease("upload", None):
+            # Atomic journal replacements leave this open file snapshot valid.
+            attachment = discord.File(str(bot.library.path), filename="anime.json")
+            try:
+                await ctx.send(file=attachment)
+            finally:
+                attachment.close()
 
     @bot.command(name="history", ignore_extra=False)
     async def history_entry(ctx, mal_id: int):
         await ctx.send(bot.library.summary(mal_id).replace("\n", " | "))
 
     @bot.command(name="resume", aliases=["retry"], ignore_extra=False)
-    async def resume_entry(ctx):
-        if bot.worker and not bot.worker.done():
-            await ctx.send("A job is already active. Use .status or .cancel.")
-            return
-        record = bot.library.latest_job(bot.user.id)
-        if record:
+    async def resume_entry(ctx, selector: str = ""):
+        records = [
+            dict(record, id=key)
+            for key, record in bot.library.data["jobs"].items()
+            if str(record.get("account_id")) == str(bot.user.id)
+            and record.get("status") != "finished"
+            and not bot.scheduler.contains(key)
+        ]
+        if selector.lower() != "all":
+            records = (
+                [r for r in records if r["id"] == selector]
+                if selector
+                else sorted(records, key=lambda r: r.get("updated_at", ""))[-1:]
+            )
+        if not records:
+            await ctx.send(
+                "No matching resumable job for this account. Use .status for active/queued jobs."
+            )
+        for record in records:
             await bot.resume_record(record, ctx)
-        else:
-            await ctx.send("No saved job for this account.")
+
+    @bot.command(name="capacity", ignore_extra=False)
+    async def capacity_entry(ctx):
+        from .capacity import report_text
+
+        await ctx.send(
+            "```\n" + report_text(bot.library.path.parent, bot.cfg) + "\n```"
+        )
 
     @bot.command(name="reset", ignore_extra=False)
     async def reset_entry(ctx, action: str = "", token: str = ""):
@@ -112,5 +130,5 @@ def register_commands(bot):
         await settings_command(bot, ctx, field, value)
 
     @bot.command(name="refetch", ignore_extra=False)
-    async def refetch_entry(ctx, destination: str):
+    async def refetch_entry(ctx, destination: str = ""):
         await refetch_command(bot, ctx, destination)

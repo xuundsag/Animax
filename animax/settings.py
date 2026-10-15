@@ -6,10 +6,13 @@ import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+import discord
+
 
 @dataclass
 class Settings:
-    channel_id: int = 0
+    channel_id: int = 0  # Legacy internal attribute; public setting is log_channel.
+    max_workers: int = 0
     upload_mb: int = 1000
     quality: int = 1080
     subtitle_mode: str = "burn"
@@ -49,6 +52,8 @@ class Settings:
     @classmethod
     def from_env(cls, path: Path | None = None):
         settings = cls()
+        if "CHANNEL_ID" in os.environ and "LOG_CHANNEL_ID" not in os.environ:
+            settings.channel_id = FIELDS["log_channel"].parse(os.environ["CHANNEL_ID"])
         for spec in FIELDS.values():
             if spec.environment in os.environ:
                 setattr(
@@ -134,6 +139,9 @@ FIELDS = {
             "slow",
         ),
     ),
+    "workers": SettingField(
+        "max_workers", "MAX_ACTIVE_WORKERS", int, minimum=0, maximum=8
+    ),
     "threads": SettingField(
         "encode_threads", "ENCODE_THREADS", int, minimum=1, maximum=16
     ),
@@ -156,8 +164,8 @@ FIELDS = {
         "subtitle_mode", "SUBTITLE_MODE", choices=("burn", "mux", "none")
     ),
     "dub_fallback": SettingField("dub_fallback", "DUB_FALLBACK", bool),
-    "channel": SettingField(
-        "channel_id", "CHANNEL_ID", int, minimum=0, maximum=2**64 - 1
+    "log_channel": SettingField(
+        "channel_id", "LOG_CHANNEL_ID", int, minimum=0, maximum=2**64 - 1
     ),
     "delete_triggers": SettingField("delete_trigger", "DELETE_COMMAND_TRIGGERS", bool),
     "status_interval": SettingField(
@@ -214,6 +222,7 @@ FIELDS = {
     "headless": SettingField("headless", "HEADLESS", bool),
 }
 ALIASES = {
+    "channel": "log_channel",
     "compression": "compress",
     "height": "quality",
     "video_crf": "crf",
@@ -225,6 +234,8 @@ def read_overrides(path: Path):
     if not path.exists():
         return {}
     data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and "channel" in data:
+        data.setdefault("log_channel", data.pop("channel"))
     if not isinstance(data, dict) or any(name not in FIELDS for name in data):
         raise ValueError("settings.json contains unknown fields or is not an object.")
     return data
@@ -272,13 +283,15 @@ async def settings_command(bot, ctx, name: str = "", value: str = ""):
     except ValueError as exc:
         await ctx.send(f"{name}: {exc}")
         return
-    if name == "channel" and parsed:
+    if name == "log_channel" and parsed:
         try:
             target = await bot.channel_for(parsed)
+            if not getattr(target, "guild", None) or isinstance(target, discord.Thread):
+                raise ValueError("Use a server text log channel")
             bot.check_permissions(target)
         except Exception:
             await ctx.send(
-                "Channel is unavailable or lacks upload permissions. Settings were not changed."
+                "Use an accessible server text channel with messaging, attachment and history permissions. Settings were not changed."
             )
             return
         if bot.busy():
@@ -294,6 +307,8 @@ async def settings_command(bot, ctx, name: str = "", value: str = ""):
         await ctx.send(f"{name}: {exc}")
         return
     bot.cfg = updated
+    if hasattr(bot, "scheduler"):
+        bot.scheduler.configure()
     text = f"{name} = {spec.display(updated)} | Saved."
     if name == "preset" and updated.encoder_preset in {"ultrafast", "superfast"}:
         text += " This preset needs more bits; prefer fast/veryfast for action scenes."

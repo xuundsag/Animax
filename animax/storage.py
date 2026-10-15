@@ -35,6 +35,8 @@ class Library:
             self.data["jobs"], dict
         ):
             raise ValueError("Invalid anime.json structure. Restore a backup.")
+        if not isinstance(self.data.get("routes", {}), dict):
+            raise ValueError("Invalid anime.json routing structure. Restore a backup.")
         if not supplied:
             self.migrate_legacy()
             if not self.path.exists() or not text.strip() or data == {}:
@@ -157,14 +159,27 @@ class Library:
             row = self.data["anime"][str(mal)]["episodes"][language][str(episode)][
                 "deliveries"
             ][f"{account}:{channel}"]
-            return bool(row.get("messages"))
+            return (
+                bool(row.get("messages"))
+                and not row.get("needs_review")
+                and row.get("status") != "uploading"
+            )
         except KeyError:
             return False
 
     def job(self, job_id, **data):
-        record = self.data["jobs"].setdefault(job_id, {"created_at": now()})
+        previous = self.data["jobs"].get(job_id)
+        record = dict(previous or {"created_at": now()})
         record.update(data, updated_at=now())
-        self.save()
+        self.data["jobs"][job_id] = record
+        try:
+            self.save()
+        except Exception:
+            if previous is None:
+                self.data["jobs"].pop(job_id, None)
+            else:
+                self.data["jobs"][job_id] = previous
+            raise
 
     def latest_job(self, account, *, active_only=False):
         records = [

@@ -15,6 +15,7 @@ from .diagnostics import error_hint, error_summary
 from .encoding import video_filter
 from .rate_limits import RateLimitError
 from .resolver import Stream, choose_caption
+from .resources import disk_usage
 from .transfer_state import (
     discard_fragment_files,
     is_range_error,
@@ -51,6 +52,7 @@ async def run_process(
     *,
     timeout: float = 3600,
     max_bytes: int = 8 * 1024**3,
+    disk_root: Path | None = None,
     progress_file: Path | None = None,
     on_progress=None,
 ) -> str:
@@ -85,7 +87,7 @@ async def run_process(
                 if asyncio.get_running_loop().time() >= deadline:
                     raise MediaError("Media operation timed out.")
                 if time.monotonic() >= next_disk_check:
-                    usage = sum(p.stat().st_size for p in cwd.rglob("*") if p.is_file())
+                    usage = disk_usage(disk_root or cwd)
                     if usage > max_bytes or shutil.disk_usage(cwd).free < 256 * 1024**2:
                         raise MediaError(
                             "Temporary-storage budget exceeded or disk nearly full."
@@ -232,6 +234,9 @@ async def download(
     video_crf: int = 19,
     compression_mode: str = "quality",
     frame_rate: str = "source",
+    resources=None,
+    job=None,
+    transfer_lease=None,
 ) -> tuple[Path, str | None]:
     work.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(work).free < 512 * 1024**2:
@@ -299,6 +304,7 @@ async def download(
                     work,
                     timeout=remaining,
                     max_bytes=max_bytes,
+                    disk_root=resources.disk_root if resources else None,
                     progress_file=progress_file,
                     on_progress=on_progress,
                 )
@@ -372,136 +378,147 @@ async def download(
         "FRAME_RATE source=%s requested=%s", video.get("avg_frame_rate"), frame_rate
     )
     result = work / "episode.mp4"
-    if on_phase:
-        on_phase("Enhancing")
-    args = [
-        "ffmpeg",
-        "-nostdin",
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-y",
-        "-threads",
-        str(encode_threads),
-        "-filter_threads",
-        "1",
-        "-i",
-        str(source),
-    ]
-    if subtitle and caption_mode == "mux":
-        args += ["-i", str(subtitle)]
-    args += [
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
-        "-vf",
-        filters,
-        "-c:v",
-        "libx264",
-        "-preset",
-        encoder_preset,
-        "-crf",
-        str(video_crf),
-        "-threads",
-        str(encode_threads),
-        "-profile:v",
-        "high",
-        "-pix_fmt",
-        "yuv420p",
-        "-x264-params",
-        "sync-lookahead=0",
-        "-vsync",
-        "0",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-    ]
-    if compression_mode == "size":
-        duration = float(original_info["format"]["duration"])
-        budget = min(target_mb * 1_000_000, upload_limit or target_mb * 1_000_000)
-        bitrate = min(8_000_000, int(budget * 8 / duration * 0.94 - 128000))
-        if bitrate < 180000:
-            raise UploadTooLarge(
-                "The episode is too long for this size target. Increase target_size or use compress quality."
-            )
-        args += ["-maxrate", str(bitrate), "-bufsize", str(bitrate * 2)]
-    elif compression_mode != "quality":
-        raise ValueError("Compression mode must be quality or size.")
-    if subtitle and caption_mode == "mux":
+    if transfer_lease:
+        transfer_lease.release()
+    async with (
+        resources.lease("encode", job) if resources else contextlib.nullcontext()
+    ):
+        if on_phase:
+            on_phase("Enhancing")
+        args = [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-y",
+            "-threads",
+            str(encode_threads),
+            "-filter_threads",
+            "1",
+            "-i",
+            str(source),
+        ]
+        if subtitle and caption_mode == "mux":
+            args += ["-i", str(subtitle)]
         args += [
             "-map",
-            "1:0",
-            "-c:s",
-            "mov_text",
-            "-metadata:s:s:0",
-            "language=eng",
-            "-disposition:s:0",
-            "default",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-vf",
+            filters,
+            "-c:v",
+            "libx264",
+            "-preset",
+            encoder_preset,
+            "-crf",
+            str(video_crf),
+            "-threads",
+            str(encode_threads),
+            "-profile:v",
+            "high",
+            "-pix_fmt",
+            "yuv420p",
+            "-x264-params",
+            "sync-lookahead=0",
+            "-vsync",
+            "0",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
         ]
-    args += ["-movflags", "+faststart", str(result)]
-    # Burn failure is a real failure. Never silently replace opaque captions with soft subtitles.
-    log.info(
-        "ENCODE_START preset=%s crf=%s threads=%s mode=%s source=%sx%s source_fps=%s requested_fps=%s height=%s",
-        encoder_preset,
-        video_crf,
-        encode_threads,
-        compression_mode,
-        video["width"],
-        video["height"],
-        video.get("avg_frame_rate"),
-        frame_rate,
-        quality,
-    )
-    encode_started = time.monotonic()
-    await run_process(args, work, timeout=timeout, max_bytes=max_bytes)
-    encode_seconds = time.monotonic() - encode_started
-    result_info = await probe(result)
-    log.info(
-        "ENCODE_DONE seconds=%.2f media_seconds=%s bytes=%s",
-        encode_seconds,
-        result_info["format"].get("duration"),
-        result.stat().st_size,
-    )
-    if "mp4" not in result_info["format"].get("format_name", "").split(","):
-        raise MediaError("Final video is not a real MP4 container.")
-    if (
-        abs(
-            float(result_info["format"]["duration"])
-            - float(original_info["format"]["duration"])
+        if compression_mode == "size":
+            duration = float(original_info["format"]["duration"])
+            budget = min(target_mb * 1_000_000, upload_limit or target_mb * 1_000_000)
+            bitrate = min(8_000_000, int(budget * 8 / duration * 0.94 - 128000))
+            if bitrate < 180000:
+                raise UploadTooLarge(
+                    "The episode is too long for this size target. Increase target_size or use compress quality."
+                )
+            args += ["-maxrate", str(bitrate), "-bufsize", str(bitrate * 2)]
+        elif compression_mode != "quality":
+            raise ValueError("Compression mode must be quality or size.")
+        if subtitle and caption_mode == "mux":
+            args += [
+                "-map",
+                "1:0",
+                "-c:s",
+                "mov_text",
+                "-metadata:s:s:0",
+                "language=eng",
+                "-disposition:s:0",
+                "default",
+            ]
+        args += ["-movflags", "+faststart", str(result)]
+        # Burn failure is a real failure. Never silently replace opaque captions with soft subtitles.
+        log.info(
+            "ENCODE_START preset=%s crf=%s threads=%s mode=%s source=%sx%s source_fps=%s requested_fps=%s height=%s",
+            encoder_preset,
+            video_crf,
+            encode_threads,
+            compression_mode,
+            video["width"],
+            video["height"],
+            video.get("avg_frame_rate"),
+            frame_rate,
+            quality,
         )
-        > 3
-    ):
-        raise MediaError(
-            "MP4 duration changed unexpectedly; refusing a potentially incomplete episode."
+        encode_started = time.monotonic()
+        await run_process(
+            args,
+            work,
+            timeout=timeout,
+            max_bytes=max_bytes,
+            disk_root=resources.disk_root if resources else None,
         )
-    source.unlink()
-    (work / "ready.json").write_text(
-        json.dumps(
-            {
-                "processing_version": PROCESSING_VERSION,
-                "file": result.name,
-                "language": language,
-                "quality": quality,
-                "subtitle_mode": subtitle_mode,
-                "encoder_preset": encoder_preset,
-                "fps": frame_rate,
-                "source_fps": video.get("avg_frame_rate"),
-                "output_fps": next(
-                    item
-                    for item in result_info["streams"]
-                    if item.get("codec_type") == "video"
-                ).get("avg_frame_rate"),
-                "compression_mode": compression_mode,
-                "target_mb": target_mb if compression_mode == "size" else None,
-                "video_crf": video_crf,
-                "caption_track": track.get("label") if subtitle else None,
-                "note": note,
-            }
+        encode_seconds = time.monotonic() - encode_started
+        result_info = await probe(result)
+        log.info(
+            "ENCODE_DONE seconds=%.2f media_seconds=%s bytes=%s",
+            encode_seconds,
+            result_info["format"].get("duration"),
+            result.stat().st_size,
         )
-    )
-    return result, note
+        if "mp4" not in result_info["format"].get("format_name", "").split(","):
+            raise MediaError("Final video is not a real MP4 container.")
+        if (
+            abs(
+                float(result_info["format"]["duration"])
+                - float(original_info["format"]["duration"])
+            )
+            > 3
+        ):
+            raise MediaError(
+                "MP4 duration changed unexpectedly; refusing a potentially incomplete episode."
+            )
+        source.unlink()
+        (work / "ready.json").write_text(
+            json.dumps(
+                {
+                    "processing_version": PROCESSING_VERSION,
+                    "file": result.name,
+                    "language": language,
+                    "quality": quality,
+                    "subtitle_mode": subtitle_mode,
+                    "encoder_preset": encoder_preset,
+                    "fps": frame_rate,
+                    "source_fps": video.get("avg_frame_rate"),
+                    "output_fps": next(
+                        item
+                        for item in result_info["streams"]
+                        if item.get("codec_type") == "video"
+                    ).get("avg_frame_rate"),
+                    "compression_mode": compression_mode,
+                    "target_mb": target_mb if compression_mode == "size" else None,
+                    "video_crf": video_crf,
+                    "caption_track": track.get("label") if subtitle else None,
+                    "note": note,
+                }
+            )
+        )
+        return result, note
 
 
 PROCESSING_VERSION = 5
@@ -560,7 +577,13 @@ async def cached_video(
 
 
 async def fit_whole_video(
-    source: Path, limit: int, *, timeout=3600, max_bytes=8 * 1024**3, encode_threads=2
+    source: Path,
+    limit: int,
+    *,
+    timeout=3600,
+    max_bytes=8 * 1024**3,
+    encode_threads=2,
+    disk_root=None,
 ):
     if source.stat().st_size <= limit:
         return source
@@ -627,6 +650,7 @@ async def fit_whole_video(
             source.parent,
             timeout=timeout,
             max_bytes=max_bytes,
+            disk_root=disk_root,
         )
         actual = await probe(result)
         if abs(float(actual["format"]["duration"]) - duration) > 3:

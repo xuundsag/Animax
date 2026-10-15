@@ -8,7 +8,6 @@ import math
 import os
 import shutil
 import signal
-import sys
 import time
 from pathlib import Path
 
@@ -31,6 +30,8 @@ from .media import (
 from .metadata import TitleError, clean_title, episode_caption, fetch_anime_title
 from .rate_limits import Cooldown, RateLimitError, cooldown_seconds
 from .resolver import Resolver, resolve_with_fallback
+from .routing import LogContext, Router
+from .scheduler import Entry, Scheduler
 from .settings import Settings
 from .storage import Library
 from .terminal import Terminal, nice_error, setup_logging
@@ -67,10 +68,12 @@ class MegaPlayBot(commands.Bot):
         self.shutting_down = False
         self.startup_done = False
 
+        self.scheduler = Scheduler(self, ROOT)
+        self.router = Router(self)
         register_commands(self)
 
     def busy(self):
-        return any(
+        return self.scheduler.busy() or any(
             task is not None and not task.done()
             for task in (self.worker, self.reset_task, self.refetch_task)
         )
@@ -89,13 +92,19 @@ class MegaPlayBot(commands.Bot):
         )
         if not self.startup_done:
             self.startup_done = True
+            self.scheduler.configure()
             if self.cfg.auto_resume:
-                record = self.library.latest_job(self.user.id, active_only=True)
-                if record:
+                records = [
+                    dict(r, id=k)
+                    for k, r in self.library.data["jobs"].items()
+                    if str(r.get("account_id")) == str(self.user.id)
+                    and r.get("status") in {"queued", "running", "interrupted"}
+                ]
+                for record in sorted(records, key=lambda r: r.get("created_at", "")):
                     try:
                         await self.resume_record(record)
                     except Exception as exc:
-                        log.exception("Automatic resume failed")
+                        log.exception("Automatic resume failed for %s", record["id"])
                         self.ui.error(exc)
 
     async def on_message(self, message):
@@ -144,30 +153,52 @@ class MegaPlayBot(commands.Bot):
                 )
 
     async def resume_record(self, record, ctx=None):
-        target = await self.channel_for(record["channel_id"])
-        self.check_permissions(target)
-        if ctx is None:
-            origin = await self.channel_for(
-                record.get("command_channel_id", record["channel_id"])
+        if self.scheduler.contains(record["id"]):
+            return False
+        fixed = (
+            await self.channel_for(record["channel_id"])
+            if record.get("routed", True)
+            else None
+        )
+        anchor = fixed or await self.channel_for(
+            record.get("anchor_channel_id", record["channel_id"])
+        )
+        origin = (
+            ctx.channel
+            if ctx is not None and not self.cfg.channel_id
+            else await self.channel_for(
+                self.cfg.channel_id
+                or record.get(
+                    "log_channel_id",
+                    record.get("command_channel_id", record["channel_id"]),
+                )
             )
-
-            class Context:
-                channel = origin
-
-                async def send(self, content):
-                    return await origin.send(content)
-
-            ctx = Context()
+        )
+        self.check_permissions(origin)
+        if fixed:
+            self.check_permissions(fixed)
         job = Job(
             int(record["mal"]),
             record["language"],
             int(record["start"]),
             int(record["end"]),
-            target.id,
+            fixed.id if fixed else anchor.id,
             title=record.get("title", ""),
             id=record["id"],
         )
-        await self.launch_job(ctx, target, job, False)
+        force = bool(
+            record.get("force")
+            and record.get("status") == "queued"
+            and not record.get("routed", True)
+        )
+        return await self.launch_job(
+            LogContext(origin, ctx),
+            anchor,
+            job,
+            force,
+            fixed_target=fixed,
+            notify=ctx is not None,
+        )
 
     async def download_command(
         self, ctx, mal_id: int, language: str, start: int, end: int, mode="resume"
@@ -176,9 +207,6 @@ class MegaPlayBot(commands.Bot):
         validate_request(mal_id, language, start, end, self.cfg.max_episodes)
         if mode.lower() not in {"resume", "force"}:
             raise commands.BadArgument("Mode must be resume or force.")
-        if self.worker and not self.worker.done():
-            await ctx.send("One job is already running. Use .status or .cancel.")
-            return
         target = (
             await self.channel_for(self.cfg.channel_id)
             if self.cfg.channel_id
@@ -198,34 +226,66 @@ class MegaPlayBot(commands.Bot):
             if trigger is not None:
                 await self.safe_delete(trigger, "download trigger")
 
-    async def launch_job(self, ctx, target, job, force):
+    async def launch_job(
+        self, ctx, target, job, force, *, fixed_target=None, notify=True
+    ):
         if any(
             task is not None and not task.done()
             for task in (self.reset_task, self.refetch_task)
         ):
             await ctx.send("A history maintenance task is still running.")
             return False
-        self.reset_request = None
-        if self.worker and not self.worker.done():
-            await ctx.send("Another job is active.")
+        if fixed_target is None and (
+            not getattr(target, "guild", None) or isinstance(target, discord.Thread)
+        ):
+            await ctx.send(
+                "Choose a server text log channel; automatic anime destinations cannot use a DM or thread as their anchor."
+            )
             return False
-        self.job = job
+        self.reset_request = None
+        log_ctx = ctx if isinstance(ctx, LogContext) else LogContext(target, ctx)
+        accepted = self.scheduler.enqueue(
+            Entry(log_ctx, target, job, force, fixed_target)
+        )
+        if accepted:
+            self.job = job
+            if notify:
+                acknowledgement = (
+                    ctx.origin if isinstance(ctx, LogContext) and ctx.origin else ctx
+                )
+                try:
+                    await acknowledgement.send(
+                        f"Queued `{job.id}` | MAL {job.mal} {job.language} E{job.start}-{job.end} | Status: <#{log_ctx.channel.id}>"
+                    )
+                except Exception:
+                    log.exception(
+                        "Job %s is queued durably, but its acknowledgement failed",
+                        job.id,
+                    )
+        return accepted
+
+    async def run_managed_job(self, entry):
+        job = entry.job
+        if not job.title:
+            try:
+                job.title = await fetch_anime_title(
+                    job.mal, ROOT / "title_overrides.json"
+                )
+            except TitleError:
+                title = (
+                    self.library.data["anime"].get(str(job.mal), {}).get("title", "")
+                )
+                if not title or title.startswith("MAL "):
+                    raise
+                job.title = clean_title(title)
+        target = entry.fixed_target or await self.router.resolve(entry.anchor, job)
+        job.channel_id = target.id
         self.library.job(
-            job.id,
-            account_id=str(self.user.id),
-            channel_id=str(target.id),
-            command_channel_id=str(ctx.channel.id),
-            mal=job.mal,
-            language=job.language,
-            start=job.start,
-            end=job.end,
-            title=job.title,
-            status="queued",
+            job.id, channel_id=str(target.id), routed=True, title=job.title
         )
-        self.worker = asyncio.create_task(
-            self.run_job(ctx, target, job, self.cfg.upload_mb * 1_000_000, force)
+        await self.run_job(
+            entry.ctx, target, job, self.cfg.upload_mb * 1_000_000, entry.force
         )
-        return True
 
     async def report_loop(self, message, job):
         previous = ""
@@ -298,17 +358,21 @@ class MegaPlayBot(commands.Bot):
             references.append(
                 {"channel_id": str(ctx.channel.id), "message_id": str(message.id)}
             )
+        previous = self.delivery(job, target)
         self.record_episode(
             job,
             target,
             "preparing",
             progress_messages=references,
             progress_retained=False,
+            needs_review=bool(
+                previous.get("needs_review") or previous.get("status") == "uploading"
+            ),
         )
         return message
 
     async def clear_progress(self, job, target, current, ctx):
-        if self.cfg.channel_id:
+        if self.cfg.channel_id or job.worker_id:
             if not self.delivery(job, target).get("progress_retained"):
                 job.output_size_bytes = self.delivery(job, target).get("size_bytes")
                 self.phase(job, "Done")
@@ -434,9 +498,10 @@ class MegaPlayBot(commands.Bot):
             self.library.job(job.id, status="running")
             cached_title = self.library.data["anime"].get(str(job.mal), {}).get("title")
             try:
-                job.title = await fetch_anime_title(
-                    job.mal, ROOT / "title_overrides.json"
-                )
+                if not job.title:
+                    job.title = await fetch_anime_title(
+                        job.mal, ROOT / "title_overrides.json"
+                    )
             except TitleError:
                 if cached_title and not cached_title.startswith("MAL "):
                     job.title = clean_title(cached_title)
@@ -444,9 +509,16 @@ class MegaPlayBot(commands.Bot):
                     raise
             self.library.job(job.id, title=job.title)
             for ep in range(job.start, job.end + 1):
-                if not self.library.completed(
-                    job.mal, job.language, ep, self.user.id, target.id
-                ):
+                existing = (
+                    self.library.data["anime"]
+                    .get(str(job.mal), {})
+                    .get("episodes", {})
+                    .get(job.language, {})
+                    .get(str(ep), {})
+                    .get("deliveries", {})
+                    .get(f"{self.user.id}:{target.id}")
+                )
+                if existing is None:
                     self.library.record(
                         job.mal,
                         job.title,
@@ -458,7 +530,7 @@ class MegaPlayBot(commands.Bot):
                         save=False,
                     )
             self.library.save()
-            self.ui.start(job.title)
+            self.ui.start(job.title, key=job.id, worker_id=job.worker_id)
             for episode in range(job.start, job.end + 1):
                 job.current = episode
                 job.output_size_bytes = None
@@ -493,6 +565,22 @@ class MegaPlayBot(commands.Bot):
                 upload_report = (
                     ROOT / "logs" / f"upload-{job.mal}-{job.language}-{episode}.json"
                 )
+                if job.worker_id:
+                    old_report = upload_report
+                    upload_report = (
+                        ROOT
+                        / "logs"
+                        / "uploads"
+                        / f"{self.user.id}-{target.id}"
+                        / old_report.name
+                    )
+                    upload_report.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    if old_report.exists() and not upload_report.exists():
+                        with contextlib.suppress(OSError, ValueError):
+                            legacy = json.loads(old_report.read_text())
+                            if str(legacy.get("channel_id")) == str(target.id):
+                                shutil.copyfile(old_report, upload_report)
+                                upload_report.chmod(0o600)
                 delivered = False
                 upload_started = False
                 message = None
@@ -549,73 +637,80 @@ class MegaPlayBot(commands.Bot):
                     attempt = 0
                     rate_hits = 0
                     while source is None:
-                        await self.wait_for_cdn(ctx, job)
-                        self.phase(
-                            job, f"Resolving · attempt {attempt + 1}/{cfg.attempts}"
-                        )
-                        self.record_episode(job, target, "downloading")
                         try:
-                            async with Resolver(
-                                cfg.resolve_timeout, cfg.headless
-                            ) as resolver:
-                                async with resolve_with_fallback(
-                                    resolver,
-                                    job.mal,
-                                    job.language,
-                                    episode,
-                                    cfg.dub_fallback,
-                                ) as resolved:
-                                    stream, job.actual_language, reason = resolved
-                                    job.fallback_reason = reason or ""
-                                    self.record_episode(job, target, "resolved")
-                                    if reason:
-                                        self.ui.event(
-                                            f"E{episode} | SUB fallback: {reason}",
-                                            "yellow",
+                            async with self.scheduler.resources.lease(
+                                "transfer", job
+                            ) as transfer_lease:
+                                await self.wait_for_cdn(ctx, job)
+                                self.phase(
+                                    job,
+                                    f"Resolving · attempt {attempt + 1}/{cfg.attempts}",
+                                )
+                                self.record_episode(job, target, "downloading")
+                                async with Resolver(
+                                    cfg.resolve_timeout, cfg.headless
+                                ) as resolver:
+                                    async with resolve_with_fallback(
+                                        resolver,
+                                        job.mal,
+                                        job.language,
+                                        episode,
+                                        cfg.dub_fallback,
+                                    ) as resolved:
+                                        stream, job.actual_language, reason = resolved
+                                        job.fallback_reason = reason or ""
+                                        self.record_episode(job, target, "resolved")
+                                        if reason:
+                                            self.ui.event(
+                                                f"E{episode} | SUB fallback: {reason}",
+                                                "yellow",
+                                            )
+                                        transfer = await stream.detach(
+                                            job.actual_language,
+                                            with_captions=job.actual_language == "dub"
+                                            or cfg.subtitle_mode != "none",
                                         )
-                                    transfer = await stream.detach(
-                                        job.actual_language,
-                                        with_captions=job.actual_language == "dub"
-                                        or cfg.subtitle_mode != "none",
-                                    )
-                            self.phase(job, "Downloading")
+                                self.phase(job, "Downloading")
 
-                            def progress(data):
-                                job.progress = data
-                                self.ui.update(job)
+                                def progress(data):
+                                    job.progress = data
+                                    self.ui.update(job)
 
-                            source, note = await download(
-                                transfer,
-                                work,
-                                job.actual_language,
-                                quality=cfg.quality,
-                                subtitle_mode=cfg.subtitle_mode,
-                                max_bytes=cfg.max_temp_bytes,
-                                timeout=cfg.operation_timeout,
-                                prepare_timeout=cfg.prepare_timeout,
-                                request_interval=max(
-                                    cfg.request_interval, self.cdn_cooldown.interval
-                                ),
-                                on_progress=progress,
-                                on_phase=lambda value: self.phase(job, value),
-                                subtitle_fallback=False,
-                                encoder_preset=cfg.encoder_preset,
-                                upload_limit=limit,
-                                encode_threads=cfg.encode_threads,
-                                target_mb=cfg.target_mb,
-                                video_crf=cfg.video_crf,
-                                compression_mode=cfg.compression_mode,
-                                frame_rate=cfg.frame_rate,
-                            )
-                            marker = work / "ready.json"
-                            ready = json.loads(marker.read_text())
-                            ready.update(
-                                requested_language=job.language,
-                                fallback_reason=job.fallback_reason,
-                            )
-                            temporary = marker.with_suffix(".tmp")
-                            temporary.write_text(json.dumps(ready))
-                            temporary.replace(marker)
+                                source, note = await download(
+                                    transfer,
+                                    work,
+                                    job.actual_language,
+                                    quality=cfg.quality,
+                                    subtitle_mode=cfg.subtitle_mode,
+                                    max_bytes=cfg.max_temp_bytes,
+                                    timeout=cfg.operation_timeout,
+                                    prepare_timeout=cfg.prepare_timeout,
+                                    request_interval=max(
+                                        cfg.request_interval, self.cdn_cooldown.interval
+                                    ),
+                                    on_progress=progress,
+                                    on_phase=lambda value: self.phase(job, value),
+                                    subtitle_fallback=False,
+                                    encoder_preset=cfg.encoder_preset,
+                                    upload_limit=limit,
+                                    encode_threads=self.scheduler.resources.plan.encoder_threads,
+                                    target_mb=cfg.target_mb,
+                                    video_crf=cfg.video_crf,
+                                    compression_mode=cfg.compression_mode,
+                                    frame_rate=cfg.frame_rate,
+                                    resources=self.scheduler.resources,
+                                    job=job,
+                                    transfer_lease=transfer_lease,
+                                )
+                                marker = work / "ready.json"
+                                ready = json.loads(marker.read_text())
+                                ready.update(
+                                    requested_language=job.language,
+                                    fallback_reason=job.fallback_reason,
+                                )
+                                temporary = marker.with_suffix(".tmp")
+                                temporary.write_text(json.dumps(ready))
+                                temporary.replace(marker)
                         except RateLimitError as exc:
                             rate_hits += 1
                             self.cdn_cooldown.slow_down(cfg.request_interval)
@@ -649,21 +744,23 @@ class MegaPlayBot(commands.Bot):
                         and cfg.compression_mode == "size"
                         and cfg.auto_compress
                     ):
-                        self.phase(job, "Enhancing")
-                        source = await fit_whole_video(
-                            source,
-                            limit,
-                            timeout=cfg.operation_timeout,
-                            max_bytes=cfg.max_temp_bytes,
-                            encode_threads=cfg.encode_threads,
-                        )
-                        marker = work / "ready.json"
-                        if marker.exists():
-                            ready = json.loads(marker.read_text())
-                            ready["file"] = source.name
-                            temporary = marker.with_suffix(".tmp")
-                            temporary.write_text(json.dumps(ready))
-                            temporary.replace(marker)
+                        async with self.scheduler.resources.lease("encode", job):
+                            self.phase(job, "Enhancing")
+                            source = await fit_whole_video(
+                                source,
+                                limit,
+                                timeout=cfg.operation_timeout,
+                                max_bytes=cfg.max_temp_bytes,
+                                disk_root=self.scheduler.resources.disk_root,
+                                encode_threads=self.scheduler.resources.plan.encoder_threads,
+                            )
+                            marker = work / "ready.json"
+                            if marker.exists():
+                                ready = json.loads(marker.read_text())
+                                ready["file"] = source.name
+                                temporary = marker.with_suffix(".tmp")
+                                temporary.write_text(json.dumps(ready))
+                                temporary.replace(marker)
                     self.phase(job, "Checking video")
                     check_upload_size(source, limit)
                     info = await probe(source)
@@ -695,82 +792,85 @@ class MegaPlayBot(commands.Bot):
                     if note:
                         job.notice = note
                         self.ui.event(note, "yellow")
-                    self.check_permissions(target)
-                    self.phase(job, "Uploading")
-                    await self.edit_status(message, job)
-                    self.record_episode(job, target, "uploading", subtitle_note=note)
-                    upload_started = True
-                    previous_upload = self.library.previous_message(
-                        job.mal, episode, self.user.id, target.id, job.language
-                    )
-                    reference = None
-                    if previous_upload:
-                        reference = discord.MessageReference(
-                            message_id=int(previous_upload["message_id"]),
-                            channel_id=target.id,
-                            guild_id=getattr(
-                                getattr(target, "guild", None), "id", None
-                            ),
-                            fail_if_not_exists=False,
-                        )
-                    sent = await upload_episode(
-                        target,
-                        source,
-                        self.video_caption(job),
-                        filename=f"MAL-{job.mal}_EP-{episode:04d}_{job.actual_language}.mp4",
-                        report_path=upload_report,
-                        timeout=cfg.upload_timeout,
-                        mode=cfg.upload_mode,
-                        on_phase=lambda value: self.phase(job, value),
-                        reference=reference,
-                        author_id=self.user.id,
-                        state_path=work / "upload-state.json",
-                        attempts=cfg.upload_attempts,
-                        fallback=cfg.upload_fallback,
-                        verify_timeout=cfg.upload_check_timeout,
-                        on_event=lambda text: self.ui.event(
-                            f"E{episode} | {text}", "yellow"
-                        ),
-                        recover_existing=pending_upload,
-                        new_delivery=bool(
-                            force
-                            and previous.get("status") == "uploaded"
-                            and not pending_upload
-                        ),
-                    )
-                    try:
-                        # Commit the accepted ID before deleting progress or cached video.
+                    async with self.scheduler.resources.lease("upload", job):
+                        self.check_permissions(target)
+                        self.phase(job, "Uploading")
+                        await self.edit_status(message, job)
                         self.record_episode(
-                            job,
+                            job, target, "uploading", subtitle_note=note
+                        )
+                        upload_started = True
+                        previous_upload = self.library.previous_message(
+                            job.mal, episode, self.user.id, target.id, job.language
+                        )
+                        reference = None
+                        if previous_upload:
+                            reference = discord.MessageReference(
+                                message_id=int(previous_upload["message_id"]),
+                                channel_id=target.id,
+                                guild_id=getattr(
+                                    getattr(target, "guild", None), "id", None
+                                ),
+                                fail_if_not_exists=False,
+                            )
+                        sent = await upload_episode(
                             target,
-                            "uploaded",
-                            message_id=str(sent.id),
-                            message_ids=[str(sent.id)],
-                            jump_url=getattr(sent, "jump_url", None),
-                            size_bytes=source.stat().st_size,
-                            duration_seconds=float(info["format"]["duration"]),
-                            filename=source.name,
-                            needs_review=False,
-                            guild_id=getattr(
-                                getattr(target, "guild", None), "id", None
+                            source,
+                            self.video_caption(job),
+                            filename=f"MAL-{job.mal}_EP-{episode:04d}_{job.actual_language}.mp4",
+                            report_path=upload_report,
+                            timeout=cfg.upload_timeout,
+                            mode=cfg.upload_mode,
+                            on_phase=lambda value: self.phase(job, value),
+                            reference=reference,
+                            author_id=self.user.id,
+                            state_path=work / "upload-state.json",
+                            attempts=cfg.upload_attempts,
+                            fallback=cfg.upload_fallback,
+                            verify_timeout=cfg.upload_check_timeout,
+                            on_event=lambda text: self.ui.event(
+                                f"E{episode} | {text}", "yellow"
                             ),
-                            reply_to_message_id=str(reference.message_id)
-                            if reference
-                            else None,
-                            caption_update_pending=False,
+                            recover_existing=pending_upload,
+                            new_delivery=bool(
+                                force
+                                and previous.get("status") == "uploaded"
+                                and not pending_upload
+                            ),
                         )
-                    except Exception as exc:
-                        log.critical(
-                            "UPLOAD ACCEPTED BUT JOURNAL FAILED: channel=%s message=%s",
-                            target.id,
-                            sent.id,
-                            exc_info=True,
-                        )
-                        raise JournalCommitFailure(
-                            f"Discord accepted message {sent.id}, but anime.json could not be saved. Do not resend blindly; repair the journal first.",
-                            stage="journal",
-                            outcome_unknown=True,
-                        ) from exc
+                        try:
+                            # Commit the accepted ID before deleting progress or cached video.
+                            self.record_episode(
+                                job,
+                                target,
+                                "uploaded",
+                                message_id=str(sent.id),
+                                message_ids=[str(sent.id)],
+                                jump_url=getattr(sent, "jump_url", None),
+                                size_bytes=source.stat().st_size,
+                                duration_seconds=float(info["format"]["duration"]),
+                                filename=source.name,
+                                needs_review=False,
+                                guild_id=getattr(
+                                    getattr(target, "guild", None), "id", None
+                                ),
+                                reply_to_message_id=str(reference.message_id)
+                                if reference
+                                else None,
+                                caption_update_pending=False,
+                            )
+                        except Exception as exc:
+                            log.critical(
+                                "UPLOAD ACCEPTED BUT JOURNAL FAILED: channel=%s message=%s",
+                                target.id,
+                                sent.id,
+                                exc_info=True,
+                            )
+                            raise JournalCommitFailure(
+                                f"Discord accepted message {sent.id}, but anime.json could not be saved. Do not resend blindly; repair the journal first.",
+                                stage="journal",
+                                outcome_unknown=True,
+                            ) from exc
                     delivered = True
                     upload_started = False
                     job.sent += 1
@@ -914,10 +1014,11 @@ class MegaPlayBot(commands.Bot):
             except OSError:
                 log.critical("Could not persist final job state", exc_info=True)
             await self.stop_reporter(reporter)
-            self.ui.finish()
+            self.ui.finish(job.id)
 
     async def close(self):
         self.shutting_down = True
+        await self.scheduler.close()
         if self.worker and not self.worker.done():
             self.worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -984,12 +1085,6 @@ def main():
     ui.banner()
     try:
         dependency_report()
-        if "--setup" in sys.argv or "--repair" in sys.argv:
-            ui.event(
-                "Python dependencies and FFmpeg are ready. Use manage.py doctor to check Chromium OS libraries.",
-                "green",
-            )
-            return
         token = os.getenv("DISCORD_TOKEN", "").strip()
         if not token or token == "YOUR_USER_TOKEN_HERE":
             raise ValueError(
@@ -1013,7 +1108,3 @@ def main():
         log.exception("Startup stopped")
         ui.error(exc)
         raise SystemExit(1)
-
-
-if __name__ == "__main__":
-    main()

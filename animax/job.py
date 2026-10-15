@@ -16,6 +16,7 @@ class Job:
     end: int
     channel_id: int
     title: str = ""
+    worker_id: int = 0
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     current: int = 0
     phase: str = "Queued"
@@ -74,4 +75,5 @@ class Job:
             parts.append("Captions unavailable")
         if self.error:
             parts.append(" ".join(self.error.split())[:260])
-        return " | ".join(parts)
+        prefix = f"W{self.worker_id} : " if self.worker_id else ""
+        return prefix + " | ".join(parts)

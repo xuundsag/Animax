@@ -8,6 +8,7 @@ import re
 from datetime import datetime, timezone
 
 from .metadata import TitleError, clean_title
+from .routing import category_id, marker
 from .storage import Library
 
 log = logging.getLogger("animax.refetch")
@@ -260,6 +261,72 @@ async def collect_history(channel, account, candidate, progress=None):
     return scanned
 
 
+async def scope_channels(anchor, account):
+    guild = getattr(anchor, "guild", None)
+    if guild is None:
+        return [anchor], 0
+    member = getattr(guild, "me", None) or await guild.fetch_member(int(account))
+    if str(member.id) != str(account):
+        raise PermissionError("Cannot establish account permissions")
+    scope = category_id(anchor)
+    channels = [
+        c
+        for c in await guild.fetch_channels()
+        if callable(getattr(c, "history", None))
+        and (scope is None or category_id(c) == scope)
+    ]
+    readable = []
+    for channel in channels:
+        permissions = channel.permissions_for(member)
+        if permissions.view_channel and permissions.read_message_history:
+            readable.append(channel)
+    if not readable:
+        raise PermissionError("No readable channels in the selected scope")
+    return readable, len(channels) - len(readable)
+
+
+def rebuild_routes(candidate, channels, account):
+    by_id = {str(c.id): c for c in channels if getattr(c, "guild", None)}
+    owners = {}
+    for mal, anime in candidate.data["anime"].items():
+        for episodes in anime["episodes"].values():
+            for episode in episodes.values():
+                for row in episode["deliveries"].values():
+                    cid = str(row.get("channel_id"))
+                    if (
+                        cid in by_id
+                        and str(row.get("account_id")) == str(account)
+                        and row.get("messages")
+                    ):
+                        owners.setdefault(cid, set()).add(mal)
+    grouped = {}
+    for cid, mals in owners.items():
+        if len(mals) != 1:
+            continue
+        mal = next(iter(mals))
+        channel = by_id[cid]
+        if marker(channel) not in {None, int(mal)}:
+            continue
+        key = f"{account}:{channel.guild.id}:{category_id(channel) or 0}:{mal}"
+        grouped.setdefault(key, []).append((channel, mal))
+    routes = candidate.data.setdefault("routes", {})
+    for key, matches in grouped.items():
+        if len(matches) == 1:
+            channel, mal = matches[0]
+            routes[key] = dict(
+                account_id=str(account),
+                guild_id=str(channel.guild.id),
+                category_id=str(category_id(channel)) if category_id(channel) else None,
+                mal=int(mal),
+                title=candidate.data["anime"][mal]["title"],
+                channel_id=str(channel.id),
+                channel_name=channel.name,
+                creation_pending=False,
+            )
+        else:
+            routes.pop(key, None)
+
+
 async def run_refetch(bot, ctx, channel_id):
     status = None
     committed = False
@@ -271,22 +338,34 @@ async def run_refetch(bot, ctx, channel_id):
             )
             return
         status = await ctx.send(
-            f"Refetching <#{channel_id}> | Scanning message history"
+            f"Refetching scope of <#{channel_id}> | Scanning category or guild history"
         )
         candidate = Library(bot.library.path, data=copy.deepcopy(bot.library.data))
 
         async def progress(scanned):
             try:
                 await status.edit(
-                    content=f"Refetching <#{channel_id}> | {scanned} messages scanned"
+                    content=f"Refetching scope of <#{channel_id}> | {scanned} messages scanned"
                 )
             except Exception:
                 log.warning("Refetch progress edit failed", exc_info=True)
 
-        scanned = await asyncio.wait_for(
-            collect_history(channel, bot.user.id, candidate, progress),
-            bot.cfg.refetch_timeout,
+        async def collect_scope():
+            channels, skipped = await scope_channels(channel, bot.user.id)
+            scanned = 0
+            for item in channels:
+                base = scanned
+
+                async def combined(count):
+                    await progress(base + count)
+
+                scanned += await collect_history(item, bot.user.id, candidate, combined)
+            return scanned, channels, skipped
+
+        scanned, channels, skipped = await asyncio.wait_for(
+            collect_scope(), bot.cfg.refetch_timeout
         )
+        rebuild_routes(candidate, channels, bot.user.id)
         count = normalize(candidate)
         if not count:
             text = "No recoverable uploads or valid anime.json export found. History was not changed."
@@ -294,7 +373,7 @@ async def run_refetch(bot, ctx, channel_id):
             candidate.save()
             bot.library.data = candidate.data
             committed = True
-            text = f"Refetched {count} uploaded messages from {scanned} scanned messages. anime.json saved."
+            text = f"Refetched {count} uploaded messages from {scanned} scanned messages across {len(channels)} channels ({skipped} inaccessible channels skipped). anime.json saved."
     except asyncio.CancelledError:
         text = "Refetch cancelled. History was not changed."
     except Exception:
@@ -313,7 +392,7 @@ async def run_refetch(bot, ctx, channel_id):
         )
 
 
-async def refetch_command(bot, ctx, destination: str):
+async def refetch_command(bot, ctx, destination: str = ""):
     if bot.busy():
         await ctx.send(
             "Wait for the current job or maintenance task to stop before refetching."
@@ -345,6 +424,7 @@ async def refetch_command(bot, ctx, destination: str):
                 "anime.json is not empty. Refetch will not overwrite existing history."
             )
             return
+    destination = destination or str(bot.cfg.channel_id or ctx.channel.id)
     match = re.fullmatch(r"(?:<#([0-9]+)>|([0-9]+))", destination.strip())
     try:
         channel_id = (

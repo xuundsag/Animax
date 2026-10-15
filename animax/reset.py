@@ -103,10 +103,10 @@ async def handle_reset(bot, ctx, action: str, token: str):
     if bot.reset_task and not bot.reset_task.done():
         await ctx.send("Reset is already running.")
         return
-    if (bot.worker and not bot.worker.done()) or (
-        bot.refetch_task and not bot.refetch_task.done()
-    ):
-        await ctx.send("Use .cancel and wait for the job to stop before resetting.")
+    if bot.busy():
+        await ctx.send(
+            "Use .cancel all and wait for all jobs to stop before resetting."
+        )
         return
     action = action.lower()
     if action == "cancel":

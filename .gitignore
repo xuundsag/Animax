@@ -13,13 +13,10 @@ state.json.tmp
 title_overrides.json
 cdn_cooldown.json
 cdn_cooldown.tmp
-.detached.json
 .animax.lock
 .bootstrap.lock
 logs/
 downloads/
-.migration-backups/
-.release-backups/
 .reset-pending-*/
 
 # Local dependencies and generated output

@@ -66,6 +66,8 @@ class Cooldown:
         self.save()
 
     def relax(self, base=0.25):
+        if self.remaining() > 0:
+            return
         self.interval = max(base, (self.interval or base) * 0.8)
         self.save()
 

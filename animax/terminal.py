@@ -24,12 +24,12 @@ def nice_error(exc):
     if "another animax instance" in text:
         return (
             "ANX-RUNNING",
-            "Another ANIMAX instance holds the lock. Stop the existing service/detached/foreground process first.",
+            "Another ANIMAX instance holds the lock. Stop the existing bot process first.",
         )
     if "missing from" in text or "ffmpeg" in text and "missing" in text:
         return (
             "ANX-SETUP",
-            "A runtime dependency is missing. Run bash install.sh; Python packages can also be repaired with python3 bot.py --repair.",
+            "A runtime dependency is missing. Install FFmpeg and run pip install -r requirements.txt in the same Python environment.",
         )
     if "permission denied" in text:
         return (
@@ -74,7 +74,7 @@ def nice_error(exc):
     if "libnspr" in text or "shared libraries" in text or "browsertype.launch" in text:
         return (
             "ANX-BROWSER",
-            "Chromium cannot start. Run bash install.sh to install its Linux dependencies.",
+            "Chromium cannot start. Install Chromium system dependencies with python -m playwright install --with-deps chromium.",
         )
     if "subtitle" in text:
         return (
@@ -109,14 +109,13 @@ class Terminal:
             transient=False,
             disable=not self.tty,
         )
-        self.task = None
-        self.last_stage = None
-        self.last_bucket = -1
+        self.tasks = {}
+        self.last = {}
 
     def banner(self):
         self.console.print(
             Text(
-                "ANIMAX 2.3.1  |  .help for commands  |  Ctrl+C saves progress",
+                "ANIMAX 2.4.0  |  .help for commands  |  Ctrl+C saves progress",
                 style="bold cyan",
             )
         )
@@ -126,12 +125,14 @@ class Terminal:
             Text(f"[{time.strftime('%H:%M:%S')}] {message}", style=style)
         )
 
-    def start(self, title):
-        self.finish()
+    def start(self, title, key="default", worker_id=0):
+        self.finish(key)
         self.progress.start()
-        self.task = self.progress.add_task(title, total=100, label="Resolving")
-        self.last_stage = None
-        self.last_bucket = -1
+        self.tasks[key] = self.progress.add_task(
+            f"W{worker_id} : {title}" if worker_id else title,
+            total=100,
+            label="Resolving",
+        )
 
     def update(self, job):
         fraction = job.progress.get("fraction")
@@ -157,28 +158,34 @@ class Terminal:
                 speed = job.progress.get("speed") or 0
                 if speed:
                     label += f" | {speed / 1024**2:.2f} MiB/s"
-        if self.task is not None:
+        task = self.tasks.get(job.id, self.tasks.get("default"))
+        prefix = f"W{job.worker_id} : " if job.worker_id else ""
+        if task is not None:
             self.progress.update(
-                self.task,
-                description=f"E{job.current} | {job.title[:32]}",
+                task,
+                description=f"{prefix}E{job.current} | {job.title[:32]}",
                 completed=percent or 0,
                 label=label,
             )
         if not self.tty:
             bucket = int((percent or 0) // 10)
-            if job.phase != self.last_stage or bucket > self.last_bucket:
-                self.event(f"{job.title} | E{job.current} | {label}")
-                self.last_stage, self.last_bucket = job.phase, bucket
+            last_stage, last_bucket = self.last.get(job.id, (None, -1))
+            if job.phase != last_stage or bucket > last_bucket:
+                self.event(f"{prefix}{job.title} | E{job.current} | {label}")
+                self.last[job.id] = job.phase, bucket
 
     def error(self, exc, log_name="logs/bot.log"):
         code, message = nice_error(exc)
         self.event(f"{code} | {message} | {log_name}", "red")
 
-    def finish(self):
-        if self.task is not None:
-            self.progress.remove_task(self.task)
-        self.task = None
-        self.progress.stop()
+    def finish(self, key=None):
+        for entry in list(self.tasks) if key is None else [key]:
+            task = self.tasks.pop(entry, None)
+            if task is not None:
+                self.progress.remove_task(task)
+            self.last.pop(entry, None)
+        if not self.tasks:
+            self.progress.stop()
 
 
 def setup_logging(root: Path):
