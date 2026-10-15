@@ -27,7 +27,15 @@ from .media import (
     fit_whole_video,
     probe,
 )
-from .metadata import TitleError, clean_title, episode_caption, fetch_anime_title
+from .metadata import (
+    TitleError,
+    clean_title,
+    episode_caption,
+    fetch_anime_title,
+    provisional_title,
+    saved_anime_title,
+    title_override,
+)
 from .rate_limits import Cooldown, RateLimitError, cooldown_seconds
 from .resolver import Resolver, resolve_with_fallback
 from .routing import LogContext, Router
@@ -67,6 +75,9 @@ class MegaPlayBot(commands.Bot):
         self.refetch_task = None
         self.shutting_down = False
         self.startup_done = False
+        self.title_lock = asyncio.Lock()
+        self.title_retry_after = 0.0
+        self.title_next_request = 0.0
 
         self.scheduler = Scheduler(self, ROOT)
         self.router = Router(self)
@@ -264,20 +275,70 @@ class MegaPlayBot(commands.Bot):
                     )
         return accepted
 
+    async def resolve_job_title(self, job):
+        # An interrupted upload must retain the caption identity used by its saved intent.
+        if job.title:
+            return clean_title(job.title), "saved job"
+        try:
+            override = title_override(job.mal, ROOT / "title_overrides.json")
+        except TitleError:
+            log.warning(
+                "Ignoring invalid title overrides; continuing with cache/provider/ID",
+                exc_info=True,
+            )
+            override = None
+        if override:
+            return override, "override"
+        cached = saved_anime_title(self.library.data, job.mal)
+        if cached:
+            return cached, "anime.json"
+        if self.title_lock.locked():
+            self.phase(job, "Waiting title lookup")
+        async with self.title_lock:
+            if time.monotonic() >= self.title_retry_after:
+                self.phase(job, "Looking up title")
+                await asyncio.sleep(max(0, self.title_next_request - time.monotonic()))
+                try:
+                    title = clean_title(
+                        await asyncio.wait_for(fetch_anime_title(job.mal), timeout=20)
+                    )
+                    return title, "provider"
+                except (TitleError, asyncio.TimeoutError):
+                    self.title_retry_after = time.monotonic() + 60
+                    log.warning(
+                        "TITLE_LOOKUP_UNAVAILABLE job=%s mal=%s; continuing with MAL identity (no pause)",
+                        job.id,
+                        job.mal,
+                        exc_info=True,
+                    )
+                finally:
+                    self.title_next_request = time.monotonic() + 1
+        return f"MAL {job.mal}", "MAL ID fallback"
+
     async def run_managed_job(self, entry):
         job = entry.job
-        if not job.title:
-            try:
-                job.title = await fetch_anime_title(
-                    job.mal, ROOT / "title_overrides.json"
-                )
-            except TitleError:
-                title = (
-                    self.library.data["anime"].get(str(job.mal), {}).get("title", "")
-                )
-                if not title or title.startswith("MAL "):
-                    raise
-                job.title = clean_title(title)
+        job.current = job.start
+        job.title, title_source = await self.resolve_job_title(job)
+        self.library.job(
+            job.id,
+            title=job.title,
+            title_source=title_source,
+            title_provisional=provisional_title(job.title, job.mal),
+        )
+        log.info(
+            "WORKER_TITLE worker=W%s job=%s mal=%s source=%s title=%s",
+            job.worker_id,
+            job.id,
+            job.mal,
+            title_source,
+            job.title,
+        )
+        if title_source == "MAL ID fallback":
+            self.ui.event(
+                f"W{job.worker_id} | Title service unavailable; continuing as MAL {job.mal}",
+                "yellow",
+            )
+        self.phase(job, "Preparing anime channel")
         target = entry.fixed_target or await self.router.resolve(entry.anchor, job)
         job.channel_id = target.id
         self.library.job(

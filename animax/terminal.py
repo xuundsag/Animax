@@ -115,7 +115,7 @@ class Terminal:
     def banner(self):
         self.console.print(
             Text(
-                "ANIMAX 2.4.0  |  .help for commands  |  Ctrl+C saves progress",
+                "ANIMAX 2.4.1  |  .help for commands  |  Ctrl+C saves progress",
                 style="bold cyan",
             )
         )

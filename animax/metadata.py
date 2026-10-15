@@ -32,17 +32,51 @@ def episode_caption(title: str, episode: int) -> str:
     return " | ".join((f"**{heading}**", f"`E{episode}`"))
 
 
+def title_override(mal_id: int, path: Path | None):
+    if path is None or not path.exists():
+        return None
+    try:
+        overrides = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise TitleError("Cannot read title_overrides.json as valid JSON.") from exc
+    if not isinstance(overrides, dict):
+        raise TitleError("title_overrides.json must contain a JSON object.")
+    return clean_title(overrides[str(mal_id)]) if str(mal_id) in overrides else None
+
+
+def provisional_title(title, mal_id):
+    return str(title).strip().casefold() in {f"mal {mal_id}", f"anime-{mal_id}", ""}
+
+
+def saved_anime_title(data, mal_id):
+    anime = data.get("anime", {}).get(str(mal_id), {})
+    candidates = [anime.get("title") if isinstance(anime, dict) else None]
+    for group in ("routes", "jobs"):
+        records = [
+            item
+            for item in data.get(group, {}).values()
+            if isinstance(item, dict) and str(item.get("mal")) == str(mal_id)
+        ]
+        records.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
+        candidates.extend(item.get("title") for item in records)
+    for value in candidates:
+        try:
+            title = clean_title(value)
+        except TitleError:
+            continue
+        if not provisional_title(title, mal_id):
+            return title
+    return None
+
+
 async def fetch_anime_title(mal_id: int, overrides_path: Path | None = None) -> str:
     if mal_id < 1:
         raise ValueError("MAL ID must be positive.")
-    if overrides_path and overrides_path.exists():
-        overrides = json.loads(overrides_path.read_text(encoding="utf-8"))
-        if not isinstance(overrides, dict):
-            raise TitleError("title_overrides.json must contain a JSON object.")
-        if str(mal_id) in overrides:
-            return clean_title(overrides[str(mal_id)])
+    override = title_override(mal_id, overrides_path)
+    if override:
+        return override
 
-    timeout = aiohttp.ClientTimeout(total=15)
+    timeout = aiohttp.ClientTimeout(total=8, connect=4)
     errors = []
     async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
         # AniList maps MAL IDs directly. One request per job, never per episode.
@@ -62,6 +96,7 @@ async def fetch_anime_title(mal_id: int, overrides_path: Path | None = None) -> 
             aiohttp.ClientError,
             asyncio.TimeoutError,
             KeyError,
+            AttributeError,
             TypeError,
             ValueError,
             TitleError,
@@ -78,6 +113,7 @@ async def fetch_anime_title(mal_id: int, overrides_path: Path | None = None) -> 
             aiohttp.ClientError,
             asyncio.TimeoutError,
             KeyError,
+            AttributeError,
             TypeError,
             ValueError,
             TitleError,

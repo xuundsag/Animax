@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import re
 import unicodedata
 
 import discord
+
+from .metadata import provisional_title
+
+log = logging.getLogger("animax.routing")
+CHANNEL_NAME_LIMIT = 64
 
 
 def category_id(channel):
@@ -16,13 +22,40 @@ def category_id(channel):
     )
 
 
-def slug(title, mal):
+def legacy_slug(title, mal):
     text = (
         unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode().lower()
     )
     return (
         re.sub(r"[^a-z0-9]+", "-", text).strip("-")[:90].rstrip("-") or f"anime-{mal}"
     )
+
+
+def with_mal(name, mal):
+    suffix = f"-{mal}"
+    if name.endswith(suffix) and len(name) <= CHANNEL_NAME_LIMIT:
+        return name
+    budget = CHANNEL_NAME_LIMIT - len(suffix)
+    return name[:budget].rstrip("-") + suffix
+
+
+def slug(title, mal):
+    if provisional_title(title, mal):
+        return f"anime-{mal}"
+    text = (
+        unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode().lower()
+    )
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    if not text:
+        return f"anime-{mal}"
+    if len(text) <= CHANNEL_NAME_LIMIT:
+        return text
+    # Short, readable title fragment, with MAL identity retained to avoid collisions.
+    words = text.split("-")[:6]
+    budget = min(48, CHANNEL_NAME_LIMIT - len(str(mal)) - 1)
+    while len(words) > 1 and len("-".join(words)) > budget:
+        words.pop()
+    return with_mal("-".join(words)[:budget].rstrip("-"), mal)
 
 
 def marker(channel):
@@ -78,6 +111,13 @@ class Router:
             scoped = [c for c in channels if category_id(c) == scope]
             saved = self.bot.library.data.get("routes", {}).get(key, {})
             name = slug(job.title, job.mal)
+            old_name = legacy_slug(job.title, job.mal)
+            compatible_names = {
+                name,
+                with_mal(name, job.mal),
+                old_name,
+                f"{old_name}-{job.mal}",
+            }
             target = next(
                 (c for c in scoped if str(c.id) == str(saved.get("channel_id"))), None
             )
@@ -91,8 +131,7 @@ class Router:
                     matches = [
                         c
                         for c in scoped
-                        if c.name in {name, f"{name}-{job.mal}"}
-                        and marker(c) in {None, job.mal}
+                        if c.name in compatible_names and marker(c) in {None, job.mal}
                     ]
                 if len(matches) > 1:
                     raise ValueError(
@@ -113,7 +152,7 @@ class Router:
                         "An earlier channel creation is unresolved. Inspect the server or manually create the matching anime channel before resuming; no blind duplicate creation."
                     )
                 if any(c.name == name for c in scoped):
-                    name = f"{name}-{job.mal}"
+                    name = with_mal(name, job.mal)
                 if any(c.name == name for c in scoped):
                     raise ValueError(
                         "Anime channel name conflicts with another MAL. Resolve its name/topic first."
@@ -147,6 +186,29 @@ class Router:
                         )
                     raise
             self.bot.check_permissions(target)
+            if (
+                target.name == f"anime-{job.mal}"
+                and marker(target) == job.mal
+                and (
+                    saved.get("title") == f"MAL {job.mal}"
+                    or saved.get("channel_provisional")
+                )
+                and name != target.name
+                and not any(c.id != target.id and c.name == name for c in scoped)
+            ):
+                try:
+                    renamed = await asyncio.wait_for(
+                        target.edit(name=name, reason="ANIMAX title recovered"),
+                        timeout=10,
+                    )
+                    if renamed is not None:
+                        target = renamed
+                except Exception:
+                    log.warning(
+                        "Could not rename placeholder channel %s; keeping its existing destination",
+                        target.id,
+                        exc_info=True,
+                    )
             save_route(
                 self.bot.library,
                 key,
@@ -154,6 +216,7 @@ class Router:
                     route,
                     channel_id=str(target.id),
                     channel_name=target.name,
+                    channel_provisional=target.name == f"anime-{job.mal}",
                     creation_pending=False,
                 ),
             )

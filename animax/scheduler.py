@@ -169,12 +169,15 @@ class Scheduler:
                 "Worker %s failed before starting its episode pipeline", worker
             )
             with contextlib.suppress(OSError):
-                self.bot.library.job(entry.job.id, status="failed")
-            entry.job.phase = "Paused"
+                self.bot.library.job(
+                    entry.job.id, status="failed", title=entry.job.title
+                )
+            entry.job.phase = "Failed"
+            entry.job.error = "Channel setup failed; see logs/bot.log."
             with contextlib.suppress(Exception):
                 await entry.ctx.send(entry.job.episode_text())
             self.bot.ui.event(
-                f"W{worker} | Job {entry.job.id} paused. See logs/bot.log", "red"
+                f"W{worker} | Job {entry.job.id} setup failed. See logs/bot.log", "red"
             )
         finally:
             self.bot.ui.finish(entry.job.id)
