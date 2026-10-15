@@ -1,12 +1,11 @@
 # ANIMAX
 
-Downloads anime by MAL ID and sends one complete video per episode. Different anime share a worker queue; episodes stay sequential within each anime. Uploads run **one at a time**, including verification and retries. Anime channels are created automatically, worker progress goes to the log channel, and jobs/history are saved in `anime.json`. Use `.help` in Discord for commands.
-
+Anime downloader from anikoto api for discord enjoy !
 ## Requirements
 
 - Python 3.10+ and pip (3.11+ recommended).
 - FFmpeg and ffprobe on PATH; Chromium system libraries. Chromium is downloaded on first start.
-- A Discord account with messaging, attachment, history and channel-creation permissions. Uses `discord.py-self`; automated user accounts can be banned by Discord. Share only authorized media.
+- Packages on requirements.txt
 
 ## Install
 
@@ -15,12 +14,12 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env`: set `DISCORD_TOKEN`, `LOG_CHANNEL_ID` (`0` uses the command channel), and `ENCODE_THREADS` (shared across workers).
+Edit `.env`: set `DISCORD_TOKEN` and configure other options .
 
 ```bash
 python bot.py
 ```
-
+**use pm2 to run this bot in background**
 ## Structure
 
 ```text
