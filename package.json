@@ -1,0 +1,17 @@
+{
+  "name": "animax-go-live-sidecar",
+  "version": "2.4.3",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.4.0"
+  },
+  "scripts": {
+    "check": "node --check animax/stream_bridge.mjs",
+    "test:feed": "node tests/stream_feed_smoke.mjs"
+  },
+  "dependencies": {
+    "@dank074/discord-video-stream": "7.0.0",
+    "@lng2004/discord.js-selfbot-v13": "3.7.2"
+  }
+}

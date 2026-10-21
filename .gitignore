@@ -1,25 +1,16 @@
-# Private configuration and runtime state
+# Private credentials/configuration and runtime state
 .env
 .env.*
 !.env.example
 settings.json
-settings.tmp
-anime.json
-anime.json.bak
-anime.json.tmp
-state.json
-state.json.bak
-state.json.tmp
 title_overrides.json
-cdn_cooldown.json
-cdn_cooldown.tmp
 .animax.lock
 .bootstrap.lock
 logs/
 downloads/
-.reset-pending-*/
 
 # Local dependencies and generated output
+node_modules/
 .venv/
 .browsers/
 __pycache__/
