@@ -70,6 +70,8 @@ function safeMediaPath(input) {
 
 async function* remuxToTransportStream(segment, offset, signal) {
   const file = safeMediaPath(segment.filePath);
+  const tag = `${segment.kind} E${segment.episode}`;
+  log(`FFMPEG_REMUX_START ${tag} file=${file} duration=${segment.duration}s`);
   const args = [
     '-hide_banner', '-loglevel', 'error', '-nostdin', '-re', '-i', file,
     '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy',
@@ -86,13 +88,19 @@ async function* remuxToTransportStream(segment, offset, signal) {
   child.stderr.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-12000); });
   const terminate = () => { if (child.exitCode === null) child.kill('SIGTERM'); };
   signal.addEventListener('abort', terminate, { once: true });
+  let firstChunk = true;
   try {
     for await (const chunk of child.stdout) {
       if (signal.aborted) break;
+      if (firstChunk) {
+        firstChunk = false;
+        log(`FFMPEG_REMUX_OUTPUT ${tag} first_chunk_bytes=${chunk.length}`);
+      }
       yield chunk;
     }
     const [code, signalName] = await Promise.race([closed, spawnError]);
     if (!signal.aborted && code !== 0) throw new Error(`FFmpeg transport remux failed (${code ?? signalName}): ${stderr.slice(-4000)}`);
+    log(`FFMPEG_REMUX_END ${tag} exit=${code ?? signalName} aborted=${signal.aborted}`);
     return { aborted: signal.aborted };
   } finally {
     signal.removeEventListener('abort', terminate);
@@ -395,6 +403,7 @@ async function handleApi(request, response) {
           episode: Number(body.episode),
           kind: body.kind,
         });
+        log(`SEGMENT_QUEUED series=${activeSeries.id} kind=${body.kind} episode=${body.episode} duration=${duration}s file=${filePath}`);
         return json(response, 200, { ok: true });
       }
       case '/api/series/skip':

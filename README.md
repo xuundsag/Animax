@@ -24,7 +24,7 @@ ANIMAX keeps its existing download, upload, history, routing, recovery, and main
 - Resumes interrupted jobs, verifies uncertain uploads before retrying, and preserves successful episode records.
 - Provides title-aware episode captions, subtitle handling, safe-size compression, configurable fonts and CPU encoding.
 - Keeps existing history search, export, reset, route-refetch, and settings commands.
-- Adds `.stream` for a continuous 1080p/16:9 CPU-only Go Live series. It fuzzy-matches anime titles, optionally skips AniSkip OP/ED intervals, burns usable English captions with the chosen font, and places a title card before each episode.
+- Adds `.stream` for a continuous 1080p/16:9 CPU-only Go Live series. It matches titles against local `anime.json`, fetches the recorded Discord upload messages, downloads their video attachments, and plays the episodes in order without altering the uploaded media.
 - While streaming episode N, prepares only episode N+1. Stream preparation and Go Live use an ultrafast CPU preset to reduce time-to-live; download encoding keeps its configured preset. Download/upload jobs and Go Live playback are kept separate: start one after the other, not concurrently.
 - **No download worker pool:** saved download jobs run one at a time. They remain resumable and cancellable; the configurable worker-count setting was removed.
 
@@ -39,8 +39,8 @@ ANIMAX keeps its existing download, upload, history, routing, recovery, and main
 ### Optional `.stream` command
 
 - Node.js **22.4.0+** and npm. Go Live dependencies are pinned in `package-lock.json` and installed lazily the first time `.stream` is used. Node does not need to be started separately.
-- A separate streaming user account with access to the server and voice channel, plus permission to send/edit status messages in the command text channel. Put its token only in `STREAM_DISCORD_TOKEN`; using the main account for both tokens is rejected.
-- An FFmpeg build with CPU `libx264`, AAC, `subtitles`/libass, MPEG-TS, and the `azmq`/libzmq filter.
+- A separate streaming user account with access to the server and voice channel. Put its token only in `STREAM_DISCORD_TOKEN`; using the main account for both tokens is rejected. The main command account owns and edits the progress message.
+- An FFmpeg build with CPU `libx264`, AAC, `drawtext`, and MPEG-TS support.
 - Enough CPU and free disk to prepare the next episode while the current episode plays. No GPU is required. A slow CPU or provider may cause a pause at an episode boundary.
 
 The Go Live library uses native WebRTC/AV dependencies. On systems without compatible prebuilt binaries, installing them may require a C/C++ toolchain.
@@ -80,7 +80,7 @@ For development checks, install `requirements-dev.txt`, then run `pytest -q`. Th
 | Command | Purpose |
 |---|---|
 | `.download MAL_ID dub\|sub START END [resume\|force] [#channel]` | Download, prepare, and upload an inclusive episode range. First use in a server needs the destination channel mention at the end. |
-| `.stream <MAL ID or anime name> <start> <end> [Yes\|No] [sub\|dub]` | Start Go Live in the command author’s current voice channel using the separate streaming account. |
+| `.stream <MAL ID or anime name> <start> <end> [sub\|dub]` | Stream uploaded Discord attachments recorded in `anime.json` in the command author’s current voice channel. |
 | `.skip` | Skip the current Go Live episode, or cancel its preparation if playback has not started. |
 | `.stop` | Stop Go Live and leave voice. Only the person who started that stream can control it. |
 | `.status` | Show the serialized download queue and current Go Live episode elapsed time/percentage. |
@@ -114,30 +114,24 @@ Only one saved download job runs at a time; additional jobs remain queued in `an
 
 ## Go Live streaming
 
-Join the voice channel where you want the stream to appear, then run the command in a server text channel:
+Join the voice channel where you want the stream to appear, then run `.stream` in a server text channel. The episode range must already be present in `anime.json` as uploaded Discord messages with video attachments.
 
 ```text
-.stream One Piece 1 100 Yes
+.stream One Piece 1 100 dub
+.stream 21 1 12 sub
+.stream "Attack on Titan" 1 25
 ```
 
-A MAL ID works too:
+- A numeric query is a MAL ID. Anime names are fuzzy-matched **only against titles stored in local `anime.json`**; `.stream` does not search an external catalog or resolve another media source.
+- For each requested episode, ANIMAX finds its recorded upload message, fetches that message through the main Python Discord account, downloads the current video attachment from Discord CDN, validates it with FFprobe/FFmpeg, and streams the local file. Missing records, messages, or attachments stop the series with a clear error; episodes are not silently replaced by an external source.
+- The command author (the main account) must be in the intended voice channel. The distinct account in `STREAM_DISCORD_TOKEN` joins that channel and handles Go Live playback. `DISCORD_TOKEN` stays in Python and is never passed to the Node sidecar.
+- Add `sub` or `dub` to select a tracked upload language. If omitted, each episode prefers a recorded dub upload, then sub. The stored video attachment is played as uploaded.
+- The command account creates and edits one progress message from the start. It shows title, current episode/range, stage, elapsed/total time, percentage, and Discord download bytes while an attachment is downloading. Status edits happen about every five seconds.
+- Console output is timestamped and reports sidecar startup/login, saved message lookup, attachment download progress, FFmpeg validation/remux, voice connection, and playback state. Details are also retained in `logs/bot.log` and `logs/stream-bridge.log`.
+- A short title card precedes each episode. The title card and source files are fed through one continuous 1920×1080, 16:9, H.264 Go Live session at 30 fps. While episode N plays, only N+1 is downloaded and validated.
+- Download/upload jobs and `.stream` are intentionally mutually exclusive to avoid competing CPU and disk workloads. The downloaded attachment is cached under `downloads/stream-cache/` only when `keep_stream_cache` is enabled.
 
-```text
-.stream 21 1 12 No
-.stream "Attack on Titan" 1 25 Yes dub
-```
-
-- Titles are searched against AniList/Jikan and the best MAL-linked fuzzy match is selected. A numeric query is treated as a MAL ID.
-- The command author (the main account) must already be in the intended voice channel. The separate account from `STREAM_DISCORD_TOKEN` joins that same channel and plays Go Live; it must also have permission to connect and stream there.
-- `.status` shows a download-like progress line, for example ``**One Piece** | `E1` | Streaming | 0:10 / 24:00 (0%)``. The sidecar edits one progress message about every five seconds with the current elapsed time and percentage.
-- `Yes` requests AniSkip opening and ending timings; `No` or no option plays the full episode. If timings are missing or the API is unavailable, the episode plays without cuts.
-- Audio defaults to `sub`. Add `sub` or `dub` to select a mode. Dub fallback follows `DUB_FALLBACK` and only occurs when dub playback or its usable English captions are positively unavailable.
-- ANIMAX caches prepared episodes under `downloads/stream-cache/`. If an episode is not cached, it resolves, downloads, and prepares it at 1080p with the selected font and optional OP/ED trimming. Missing captions are reported and do not prevent playback.
-- A title card such as “Starting Episode 7 — One Piece” precedes each episode. The card and all episodes are fed through one continuous 1920×1080, 16:9, H.264 Go Live session at 30 fps.
-- While episode N plays, only N+1 is prepared. A slower preparation can pause the series at the episode boundary.
-- Download/upload jobs and `.stream` are intentionally mutually exclusive to avoid competing CPU and disk workloads.
-
-The Go Live stream is a separate feature from `.download`: it does not create uploaded episode posts or replace anime history and upload records. Its Node sidecar is started automatically by `python bot.py` on first use of `.stream`.
+The Go Live stream is a separate feature from `.download`: it does not create upload posts or alter anime history. The Node sidecar is started automatically by the sole launcher, `python bot.py`, on first use of `.stream`.
 
 ## Settings
 
@@ -165,16 +159,16 @@ The former worker-count setting is ignored when loading older `settings.json` fi
 - **Download or upload fails:** inspect `logs/bot.log` and the episode-specific logs. Check destination permissions, free disk, source availability, and rate-limit cooldowns before retrying.
 - **First `.stream` says Node is missing:** install Node.js 22.4+ and npm, reopen the shell, confirm `node --version`, then use `.stream` again. The existing download commands do not require Node.
 - **Streaming account not ready or same-account warning:** set `STREAM_DISCORD_TOKEN` to a valid token for a distinct streaming user account. The sidecar verifies its logged-in user ID differs from the main `DISCORD_TOKEN` account before accepting stream requests.
-- **Stream appears stuck at Connecting:** first-episode preparation runs alongside voice setup, and the progress message shows stage elapsed time. Voice negotiation fails fast after 25 seconds; check the stream account’s server/voice permissions and `logs/stream-bridge.log` for DAVE or network errors.
-- **Native package or Go Live startup error:** inspect `logs/stream-bridge.log`; confirm the pinned packages in `package-lock.json`, FFmpeg `azmq`, and the Node version. The bridge is not tested against every Discord session or host.
-- **No Go Live start:** verify the command author is in the intended voice channel and that the account can connect there. DAVE negotiation, account restrictions, network conditions, and client changes can still prevent streaming.
-- **No AniSkip cut:** that episode may lack OP/ED data, or AniSkip may be unavailable. ANIMAX fails open and plays the full episode.
-- **Episode boundary pause:** the next episode may still be downloading/encoding. Check CPU, free disk, provider speed, and `threads`/`preset`.
+- **Stream appears stuck at Starting or Connecting:** check the timestamped terminal lines and `logs/bot.log` plus `logs/stream-bridge.log`. The command’s existing progress message stays visible through startup, upload lookup, CDN download, FFmpeg validation, voice connection, and playback. Voice negotiation is bounded to 25 seconds.
+- **No matching episode or attachment:** `.stream` uses only uploaded messages recorded in `anime.json`. Verify the MAL ID, language, episode number, saved channel/message IDs, and that the main account can read the channel and fetch its message history.
+- **Native package or Go Live startup error:** inspect the timestamped Node output and `logs/stream-bridge.log`; confirm the pinned packages in `package-lock.json`, CPU FFmpeg `libx264`/AAC/drawtext/MPEG-TS support, and the Node version. The bridge is not tested against every Discord session or host.
+- **No Go Live start:** verify the command author is in the intended voice channel and that the distinct streaming account can connect there. DAVE negotiation, account restrictions, network conditions, and client changes can still prevent streaming.
+- **Episode boundary pause:** the next Discord attachment may still be downloading or validating. Check CPU, free disk, and the timestamped download/probe logs.
 
 ## Security and third-party components
 
 - Discord prohibits automating normal user accounts and may terminate accounts that do so. The Python command client and optional Node Go Live sidecar use distinct user-account tokens; no live Discord playback or account-safety guarantee is claimed.
 - Keep `.env`, `anime.json`, private logs, and exported `.getlist` attachments confidential. The local stream bridge binds to loopback and uses a per-run random bearer secret.
-- Respect the media provider’s terms, copyright law, Discord rules, and AniSkip’s API conditions. ANIMAX does not bypass DRM or provider access controls.
-- Third-party components include [discord.py-self](https://github.com/dolfies/discord.py-self), [discord-video-stream](https://github.com/Discord-RE/Discord-video-stream), the [DAVE-capable selfbot client fork](https://www.npmjs.com/package/@lng2004/discord.js-selfbot-v13), [AniSkip](https://api.aniskip.com/api-docs), [AniList](https://anilist.co/), and [Jikan](https://jikan.moe/). Bundled fonts include their license files in `assets/fonts/`.
+- Respect copyright law, Discord rules, and the terms for any source used by the download commands. `.stream` downloads only attachments already recorded in `anime.json`; it does not bypass DRM or resolve an external stream source.
+- Third-party components include [discord.py-self](https://github.com/dolfies/discord.py-self), [discord-video-stream](https://github.com/Discord-RE/Discord-video-stream), the [DAVE-capable selfbot client fork](https://www.npmjs.com/package/@lng2004/discord.js-selfbot-v13), [AniList](https://anilist.co/), and [Jikan](https://jikan.moe/). Bundled fonts include their license files in `assets/fonts/`.
 - No ANIMAX project license file is included in this release; check the repository’s terms before redistribution.

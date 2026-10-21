@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+import time
 
 import discord
 from discord.ext import commands
@@ -15,7 +18,7 @@ log = logging.getLogger("animax.commands")
 
 COMMAND_HELP = {
     "download": "`.download MAL_ID dub|sub START END [resume|force] [#channel]`: inclusive range, one whole MP4 each. First use in a server requires the destination channel mention last, e.g. `.download 21 dub 1 10 #one-piece`. Later downloads reuse anime.json and ignore a supplied channel. Force can duplicate confirmed uploads; pending sends are still checked before retry.",
-    "stream": "`.stream <MAL ID or anime name> <start> <end> [Yes|No] [sub|dub]`: start Go Live in your current voice channel. The separate account in STREAM_DISCORD_TOKEN plays the video. Fuzzy title matching; OP/ED skip is optional. Requires Node.js 22.4+ when first used.",
+    "stream": "`.stream <MAL ID or anime name> <start> <end> [sub|dub]`: stream the uploaded Discord attachments recorded in anime.json, in order, to your current voice channel. Titles match against local anime.json; language is optional and auto-prefers an available dub, then sub. Requires a distinct STREAM_DISCORD_TOKEN account and Node.js 22.4+.",
     "skip": "`.skip`: skip the current Go Live episode, or cancel the episode being prepared if playback has not started.",
     "stop": "`.stop`: stop the Go Live series and leave voice. Only the person who started it can control it.",
     "status": "`.status`: show the serialized download queue and any active Go Live stream.",
@@ -73,7 +76,7 @@ def register_commands(bot):
             await ctx.send("Run `.stream` in a server text channel.")
             return
         try:
-            parse_stream_request(request)
+            parsed = parse_stream_request(request)
         except StreamRequestError as exc:
             raise commands.BadArgument(str(exc)) from None
         if bot.busy():
@@ -111,25 +114,91 @@ def register_commands(bot):
                 "A download job or maintenance task started while `.stream` was being prepared. Wait for it to finish, then try again."
             )
             return
+
+        title = discord.utils.escape_markdown(parsed.query)
+        status_text = (
+            f"**{title}** | `E{parsed.start}/{parsed.end}` | Starting Go Live | "
+            "0:00 / --:-- (0%)"
+        )
+        status_message = None
+        reporter = None
+        started = time.monotonic()
+
+        async def keep_start_status_visible():
+            while True:
+                await asyncio.sleep(5)
+                elapsed = max(0, int(time.monotonic() - started))
+                progress = (
+                    f"**{title}** | `E{parsed.start}/{parsed.end}` | "
+                    f"Starting Go Live | {elapsed // 60}:{elapsed % 60:02d} / --:-- (0%)"
+                )
+                try:
+                    await status_message.edit(content=progress)
+                except Exception as exc:
+                    log.warning(
+                        "Could not update .stream startup status", exc_info=True
+                    )
+                    ui = getattr(bot, "ui", None)
+                    if ui and hasattr(ui, "event"):
+                        ui.event(
+                            f"STREAM | startup status edit failed ({type(exc).__name__})",
+                            "yellow",
+                        )
+
         try:
+            status_message = await ctx.send(status_text)
+            ui = getattr(bot, "ui", None)
+            if ui and hasattr(ui, "event"):
+                language = parsed.language or "auto"
+                ui.event(
+                    f"STREAM | command accepted MAL/title={parsed.query!r} "
+                    f"range={parsed.start}-{parsed.end} language={language} "
+                    f"guild={ctx.guild.id} voice={channel.id}",
+                    "cyan",
+                )
+            reporter = asyncio.create_task(keep_start_status_visible())
             manager = await bot.ensure_stream_runtime()
-            result = await manager.start(
+            reporter.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reporter
+            reporter = None
+            await manager.start(
                 guild_id=int(ctx.guild.id),
                 voice_channel_id=int(channel.id),
                 text_channel_id=int(ctx.channel.id),
                 author_id=int(ctx.author.id),
                 raw=request,
+                progress_message=status_message,
             )
         except StreamBusy as exc:
-            await ctx.send(str(exc))
-            return
+            if status_message is not None:
+                with contextlib.suppress(Exception):
+                    await status_message.edit(content=f"Stream not started: {exc}")
+            else:
+                await ctx.send(str(exc))
         except Exception as exc:
-            await ctx.send(f".stream could not start: {str(exc)[:1000]}")
             log.warning(".stream startup failed", exc_info=True)
-            return
+            ui = getattr(bot, "ui", None)
+            if ui and hasattr(ui, "event"):
+                ui.event(
+                    f"STREAM | startup failed ({type(exc).__name__}): {str(exc)[:400]}",
+                    "red",
+                )
+            if status_message is not None:
+                failure = (
+                    f"**{title}** | `E{parsed.start}/{parsed.end}` | "
+                    f"Failed to start | 0:00 / --:-- (0%)\n{str(exc)[:700]}"
+                )
+                with contextlib.suppress(Exception):
+                    await status_message.edit(content=failure[:1900])
+            else:
+                await ctx.send(f".stream could not start: {str(exc)[:1000]}")
         finally:
+            if reporter is not None and not reporter.done():
+                reporter.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reporter
             bot.stream_starting = False
-        await ctx.send(result["message"])
 
     @bot.command(name="skip", ignore_extra=False)
     async def skip_stream_entry(ctx):

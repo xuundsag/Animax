@@ -1,11 +1,13 @@
-"""Single-session, continuous episode streaming with one next-episode prefetch."""
+"""Single-session Go Live playback from Discord attachments journaled in anime.json."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import math
+import re
 import shlex
 import shutil
 import time
@@ -13,17 +15,19 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import discord
+
 from .bridge import BridgeError, StreamBridge
 from .encoding import FONT_FILES
-from .metadata import TitleError, provisional_title, resolve_anime
-from .resolver import (
-    CaptionUnavailable,
-    Resolver,
-    choose_caption,
-    resolve_with_fallback,
-)
+from .metadata import TitleError, clean_title, select_best_anime
 from .settings import Settings
-from .stream_media import MediaError, cached_video, download, probe
+from .stream_media import (
+    MediaError,
+    attachment_extension,
+    download_discord_attachment,
+    ensure_playable,
+    probe,
+)
 from .titlecard import create_title_card
 
 log = logging.getLogger("animax.streaming")
@@ -40,13 +44,158 @@ class StreamBusy(RuntimeError):
     pass
 
 
+def resolve_tracked_anime(query: str, library_data: dict):
+    """Resolve only against anime.json; streaming never searches external media sites."""
+    query = " ".join(str(query or "").split()).strip()
+    if not query:
+        raise TitleError("Enter a MAL ID or anime title tracked in anime.json.")
+    anime = library_data.get("anime", {}) if isinstance(library_data, dict) else {}
+    if not isinstance(anime, dict) or not anime:
+        raise TitleError("anime.json has no uploaded anime to stream yet.")
+
+    id_query = re.sub(r"^mal\s+", "", query, flags=re.IGNORECASE).strip()
+    if id_query.isdecimal():
+        mal_id = int(id_query)
+        if mal_id < 1:
+            raise TitleError("MAL ID must be positive.")
+        row = anime.get(str(mal_id))
+        if not isinstance(row, dict):
+            raise TitleError(f"MAL {mal_id} is not tracked in anime.json.")
+        raw_title = row.get("title") or f"MAL {mal_id}"
+        try:
+            title = clean_title(raw_title)
+        except TitleError:
+            title = f"MAL {mal_id}"
+        return mal_id, title, 100
+
+    candidates = []
+    for mal_key, row in anime.items():
+        try:
+            mal_id = int(mal_key)
+        except (TypeError, ValueError):
+            continue
+        if mal_id < 1 or not isinstance(row, dict):
+            continue
+        title = row.get("title")
+        if isinstance(title, str) and title.strip():
+            candidates.append({"idMal": mal_id, "title": title})
+    try:
+        mal_id, title, score = select_best_anime(query, candidates)
+    except TitleError as exc:
+        raise TitleError(
+            f"No close title in anime.json matched `{query}`. Use a tracked MAL ID or run `.history` first."
+        ) from exc
+    return mal_id, title, score
+
+
+def select_uploaded_episode(
+    library_data: dict,
+    mal_id: int,
+    episode: int,
+    language: str | None = None,
+    *,
+    preferred_guild_id: int | str | None = None,
+    preferred_account_id: int | str | None = None,
+) -> dict:
+    """Find the newest confirmed Discord message for one tracked episode/language."""
+    anime = library_data.get("anime", {}) if isinstance(library_data, dict) else {}
+    anime_row = anime.get(str(mal_id), {}) if isinstance(anime, dict) else {}
+    episodes = anime_row.get("episodes", {}) if isinstance(anime_row, dict) else {}
+    if not isinstance(episodes, dict):
+        episodes = {}
+
+    languages = [language] if language in {"sub", "dub"} else ["dub", "sub"]
+    candidates = []
+    for track in languages:
+        episode_row = episodes.get(track, {})
+        if not isinstance(episode_row, dict):
+            continue
+        entry = episode_row.get(str(episode), {})
+        if not isinstance(entry, dict):
+            continue
+        deliveries = entry.get("deliveries", {})
+        if not isinstance(deliveries, dict):
+            continue
+        for delivery_key, delivery in deliveries.items():
+            if not isinstance(delivery, dict):
+                continue
+            key_parts = str(delivery_key).split(":", 1)
+            account_id = str(
+                delivery.get("account_id") or (key_parts[0] if key_parts else "")
+            )
+            channel_id = str(
+                delivery.get("channel_id")
+                or (key_parts[1] if len(key_parts) > 1 else "")
+            )
+            messages = delivery.get("messages")
+            if not isinstance(messages, list):
+                messages = []
+            if not messages:
+                legacy_ids = delivery.get("message_ids") or []
+                if not legacy_ids and delivery.get("message_id"):
+                    legacy_ids = [delivery["message_id"]]
+                messages = [{"message_id": value} for value in legacy_ids]
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                message_id = str(message.get("message_id") or "")
+                message_channel = str(message.get("channel_id") or channel_id)
+                if not message_id.isdecimal() or not message_channel.isdecimal():
+                    continue
+                message_account = str(message.get("account_id") or account_id)
+                guild_id = str(
+                    message.get("guild_id") or delivery.get("guild_id") or ""
+                )
+                candidates.append(
+                    {
+                        "mal_id": int(mal_id),
+                        "episode": int(episode),
+                        "language": track,
+                        "account_id": message_account,
+                        "channel_id": message_channel,
+                        "message_id": message_id,
+                        "guild_id": guild_id,
+                        "uploaded_at": str(
+                            message.get("uploaded_at")
+                            or delivery.get("updated_at")
+                            or ""
+                        ),
+                        "jump_url": message.get("jump_url"),
+                        "size_bytes": message.get("size_bytes")
+                        or delivery.get("size_bytes"),
+                    }
+                )
+
+    if not candidates:
+        if language:
+            raise MediaError(
+                f"No uploaded {language} attachment for MAL {mal_id} E{episode} is recorded in anime.json."
+            )
+        raise MediaError(
+            f"No uploaded sub or dub attachment for MAL {mal_id} E{episode} is recorded in anime.json."
+        )
+
+    preferred_guild = str(preferred_guild_id or "")
+    preferred_account = str(preferred_account_id or "")
+    language_order = {"dub": 0, "sub": 1}
+    candidates.sort(
+        key=lambda item: (
+            bool(preferred_guild and item["guild_id"] == preferred_guild),
+            bool(preferred_account and item["account_id"] == preferred_account),
+            -language_order.get(item["language"], 2) if language is None else 0,
+            item["uploaded_at"],
+        ),
+        reverse=True,
+    )
+    return candidates[0]
+
+
 @dataclass(frozen=True)
 class StreamRequest:
     query: str
     start: int
     end: int
-    skip_intro_outro: bool
-    language: str = "sub"
+    language: str | None = None
 
 
 def parse_stream_request(raw: str) -> StreamRequest:
@@ -56,23 +205,21 @@ def parse_stream_request(raw: str) -> StreamRequest:
         raise StreamRequestError(f"Could not parse the command: {exc}") from None
     if len(tokens) < 3:
         raise StreamRequestError(
-            "Usage: `.stream <MAL ID or anime name> <start episode> <end episode> [Yes|No] [sub|dub]`."
+            "Usage: `.stream <MAL ID or anime name> <start episode> <end episode> [sub|dub]`."
         )
-    language = "sub"
-    skip = False
-    seen_language = seen_skip = False
-    while tokens and tokens[-1].casefold() in {"yes", "no", "sub", "dub"}:
+
+    language = None
+    seen_language = False
+    if tokens and tokens[-1].casefold() in {"yes", "no"}:
+        raise StreamRequestError(
+            "Use only an optional `sub` or `dub` language after the episode range."
+        )
+    while tokens and tokens[-1].casefold() in {"sub", "dub"}:
         option = tokens.pop().casefold()
-        if option in {"sub", "dub"}:
-            if seen_language:
-                raise StreamRequestError("Choose only one audio language: sub or dub.")
-            language = option
-            seen_language = True
-        else:
-            if seen_skip:
-                raise StreamRequestError("Specify skip times only once: Yes or No.")
-            skip = option == "yes"
-            seen_skip = True
+        if seen_language:
+            raise StreamRequestError("Choose only one audio language: sub or dub.")
+        language = option
+        seen_language = True
     if len(tokens) < 3:
         raise StreamRequestError(
             "Enter an anime title (or MAL ID) and an episode range."
@@ -85,12 +232,12 @@ def parse_stream_request(raw: str) -> StreamRequest:
         ) from None
     query = " ".join(tokens[:-2]).strip()
     if not query:
-        raise StreamRequestError("Enter a MAL ID or anime name.")
+        raise StreamRequestError("Enter a MAL ID or anime name tracked in anime.json.")
     if start < 1 or end < start or end - start + 1 > 100:
         raise StreamRequestError(
             "Use a positive inclusive range of no more than 100 episodes."
         )
-    return StreamRequest(query, start, end, skip, language)
+    return StreamRequest(query, start, end, language)
 
 
 @dataclass
@@ -100,6 +247,8 @@ class PreparedEpisode:
     path: Path
     duration: float
     note: str | None = None
+    language: str | None = None
+    message_id: str | None = None
 
 
 @dataclass
@@ -110,7 +259,7 @@ class StreamSession:
     text_channel_id: int
     author_id: int
     request: StreamRequest
-    phase: str = "Finding anime"
+    phase: str = "Finding uploaded anime"
     mal_id: int | None = None
     title: str = ""
     current_episode: int | None = None
@@ -127,12 +276,9 @@ class StreamSession:
     episode_results: dict[int, dict] = field(default_factory=dict)
     skip_preparing: set[int] = field(default_factory=set)
     node_error: str = ""
-    fallback_notice_sent: bool = False
-    caption_notice_sent: bool = False
-    skip_notice_sent: bool = False
     card_directory: Path | None = None
     playback_episode: int | None = None
-    playback_state: str = "Preparing"
+    playback_state: str = "Starting"
     playback_elapsed: float = 0.0
     playback_duration: float = 0.0
     playback_updated_at: float | None = None
@@ -140,24 +286,64 @@ class StreamSession:
     progress_message_id: str | None = None
     progress_message_text: str = ""
     progress_task: asyncio.Task | None = None
+    progress_message: object | None = None
+    selected_languages: dict[int, str] = field(default_factory=dict)
+    download_episode: int | None = None
+    download_stage: str = ""
+    download_received: int = 0
+    download_total: int = 0
+    download_started_at: float | None = None
+    download_last_log_percent: int = -10
+    terminal_detail: str = ""
+    started_at: float | None = None
+    last_terminal_progress: int = -1
 
 
 class StreamManager:
-    def __init__(self, settings: Settings, bridge: StreamBridge, root: Path = ROOT):
+    def __init__(
+        self,
+        settings: Settings,
+        bridge: StreamBridge,
+        root: Path = ROOT,
+        *,
+        library=None,
+        attachment_lookup=None,
+        ui=None,
+        command_account_id: int | str | None = None,
+    ):
         self.settings = settings
         self.bridge = bridge
-        self.root = root
-        self.cache_root = root / "downloads" / "stream-cache"
-        self.disk_root = root / "downloads"
+        self.root = Path(root)
+        self.cache_root = self.root / "downloads" / "stream-cache"
+        self.disk_root = self.root / "downloads"
+        self.library = library
+        self.attachment_lookup = attachment_lookup
+        self.ui = ui
+        self.command_account_id = (
+            str(command_account_id) if command_account_id else None
+        )
         self.session: StreamSession | None = None
         self.lock = asyncio.Lock()
 
+    def _event(self, message: str, style="cyan"):
+        log.info("STREAM %s", message)
+        if self.ui is not None and hasattr(self.ui, "event"):
+            self.ui.event(f"STREAM | {message}", style)
+        else:
+            print(f"[{time.strftime('%H:%M:%S')}] STREAM | {message}", flush=True)
+
     async def _send(self, session: StreamSession, text: str):
+        """Fallback for secondary notices; the main status is edited in place."""
         try:
             return await self.bridge.send(session.text_channel_id, text)
         except BridgeError:
+            self._event(
+                f"Could not send a secondary stream notice: {text[:120]}", "yellow"
+            )
             log.warning(
-                "Could not send stream status to channel %s", session.text_channel_id
+                "Could not send stream status to channel %s",
+                session.text_channel_id,
+                exc_info=True,
             )
             return None
 
@@ -166,7 +352,11 @@ class StreamManager:
         if content == session.progress_message_text:
             return
         try:
-            if session.progress_message_id:
+            if session.progress_message is not None:
+                await session.progress_message.edit(content=content)
+                if getattr(session.progress_message, "id", None):
+                    session.progress_message_id = str(session.progress_message.id)
+            elif session.progress_message_id:
                 await self.bridge.edit(
                     session.text_channel_id, session.progress_message_id, content
                 )
@@ -178,11 +368,15 @@ class StreamManager:
                 if message_id:
                     session.progress_message_id = str(message_id)
             session.progress_message_text = content
-        except BridgeError:
+        except Exception as exc:
             log.warning(
                 "Could not update stream progress in channel %s",
                 session.text_channel_id,
                 exc_info=True,
+            )
+            self._event(
+                f"Progress-message edit failed ({type(exc).__name__}: {str(exc)[:180]}).",
+                "yellow",
             )
 
     async def _progress_reporter(self, session: StreamSession):
@@ -206,11 +400,15 @@ class StreamManager:
         text_channel_id: int,
         author_id: int,
         raw: str,
+        progress_message=None,
     ):
-        try:
-            request = parse_stream_request(raw)
-        except StreamRequestError:
-            raise
+        request = parse_stream_request(raw)
+        library_data = getattr(self.library, "data", None)
+        if library_data is None:
+            raise TitleError(
+                "The main Discord client did not provide anime.json for streaming."
+            )
+        mal_id, title, score = resolve_tracked_anime(request.query, library_data)
         async with self.lock:
             if self.session and self.session.task and not self.session.task.done():
                 raise StreamBusy(
@@ -223,23 +421,41 @@ class StreamManager:
                 text_channel_id=int(text_channel_id),
                 author_id=int(author_id),
                 request=request,
+                mal_id=mal_id,
+                title=title,
+                playback_episode=request.start,
+                progress_message=progress_message,
+                started_at=time.monotonic(),
+                status_started_at=time.monotonic(),
             )
             self.session = session
             session.task = asyncio.create_task(
                 self._run(session), name=f"animax-stream-{session.id[:8]}"
             )
+        language_text = (
+            f" ({request.language})" if request.language else " (auto language)"
+        )
+        self._event(
+            f"START id={session.id[:8]} MAL={mal_id} title={title!r} "
+            f"episodes={request.start}-{request.end}{language_text} "
+            f"guild={guild_id} voice={voice_channel_id}",
+        )
         return {
             "ok": True,
-            "message": (
-                f"Starting `{request.query}` E{request.start}–E{request.end} "
-                f"({request.language}; skip OP/ED: {'Yes' if request.skip_intro_outro else 'No'})."
-            ),
+            "message": f"Starting **{title}** E{request.start}–E{request.end} from anime.json.",
         }
 
     @staticmethod
     def _clock(seconds: float) -> str:
         value = max(0, int(seconds))
         return f"{value // 60}:{value % 60:02d}"
+
+    @staticmethod
+    def _size_text(value: int) -> str:
+        amount = max(0, int(value))
+        if amount < 1_000_000_000:
+            return f"{amount / 1_000_000:.1f} MB"
+        return f"{amount / 1_000_000_000:.2f} GB"
 
     def _progress_text(self, session: StreamSession) -> str:
         episode = (
@@ -253,33 +469,62 @@ class StreamManager:
         elapsed = max(0.0, float(session.playback_elapsed or 0))
         if session.playback_state == "Streaming" and session.playback_updated_at:
             elapsed += max(0.0, time.monotonic() - session.playback_updated_at)
-        if session.playback_state in {"Finding title", "Connecting", "Preparing"}:
-            stage_elapsed = (
-                max(0.0, time.monotonic() - session.status_started_at)
-                if session.status_started_at
-                else 0.0
-            )
-            timing = f"{self._clock(stage_elapsed)} elapsed"
-        elif duration > 0:
+        if duration > 0:
             elapsed = min(duration, elapsed)
             timing = (
                 f"{self._clock(elapsed)} / {self._clock(duration)} "
                 f"({min(100, int(elapsed * 100 / duration))}%)"
             )
         else:
-            timing = "0:00 / --:-- (0%)"
+            stage_elapsed = (
+                max(0.0, time.monotonic() - session.status_started_at)
+                if session.status_started_at
+                else 0.0
+            )
+            timing = f"{self._clock(stage_elapsed)} / --:-- (0%)"
+
+        title = discord.utils.escape_markdown(session.title or session.request.query)
+        state = session.playback_state
+        track = session.selected_languages.get(episode)
+        if track:
+            state += f" ({track.upper()})"
         content = (
-            f"**{session.title or session.request.query}** | `E{episode}` | "
-            f"{session.playback_state} | {timing}"
+            f"**{title}** | `E{episode}/{session.request.end}` | {state} | {timing}"
         )
-        if (
-            session.playback_state == "Connecting"
-            and session.preparing_episode
-            and session.prepare_task
-            and not session.prepare_task.done()
-        ):
-            content += f"\nPreparing E{session.preparing_episode} in parallel"
-        return content
+
+        if session.download_episode is not None:
+            download_episode = session.download_episode
+            stage = session.download_stage or "Looking up Discord upload"
+            if stage == "Downloading" and session.download_total > 0:
+                percent = min(
+                    100,
+                    int(session.download_received * 100 / session.download_total),
+                )
+                detail = (
+                    f"{self._size_text(session.download_received)} / "
+                    f"{self._size_text(session.download_total)} ({percent}%)"
+                )
+            elif stage == "Downloading":
+                detail = f"{self._size_text(session.download_received)} downloaded"
+            else:
+                detail = stage
+            if download_episode == episode and session.current_episode is None:
+                content = (
+                    f"**{title}** | `E{episode}/{session.request.end}` | "
+                    f"{stage} | {timing}"
+                )
+                if session.download_total > 0:
+                    percent = min(
+                        100,
+                        int(session.download_received * 100 / session.download_total),
+                    )
+                    content += f" · {self._size_text(session.download_received)} / {self._size_text(session.download_total)} ({percent}%)"
+            else:
+                content += f"\n↳ E{download_episode} download | {detail}"
+
+        if session.terminal_detail:
+            content += f"\n{session.terminal_detail[:500]}"
+        return content[:1900]
 
     def status(self, guild_id: int | None = None):
         session = self.session
@@ -287,17 +532,9 @@ class StreamManager:
             return {"ok": True, "message": "No active Go Live stream."}
         if guild_id is not None and int(guild_id) != session.guild_id:
             return {"ok": True, "message": "No active Go Live stream in this server."}
-        message = self._progress_text(session)
-        if (
-            session.prefetch_episode
-            and session.current_episode
-            and session.prefetch_task
-            and not session.prefetch_task.done()
-        ):
-            message += f"\nPreparing E{session.prefetch_episode}"
         return {
             "ok": True,
-            "message": message,
+            "message": self._progress_text(session),
             "phase": session.phase,
             "episode": session.current_episode or session.preparing_episode,
             "prefetchEpisode": session.prefetch_episode,
@@ -318,6 +555,7 @@ class StreamManager:
         if session.current_episode is not None and session.series_started:
             episode = session.current_episode
             await self.bridge.series_skip(session.id, episode)
+            self._event(f"SKIP id={session.id[:8]} episode={episode}")
             return {
                 "ok": True,
                 "message": f"Skipping E{episode}; the next episode will follow in the same Go Live session.",
@@ -327,6 +565,7 @@ class StreamManager:
         if episode is not None and task is not None and not task.done():
             session.skip_preparing.add(episode)
             task.cancel()
+            self._event(f"SKIP_PREPARATION id={session.id[:8]} episode={episode}")
             return {
                 "ok": True,
                 "message": f"Cancelled preparation of E{episode}; moving on to the next requested episode.",
@@ -342,6 +581,7 @@ class StreamManager:
         if session.series_started:
             with contextlib.suppress(BridgeError):
                 await self.bridge.series_abort(session.id)
+        self._event(f"STOP_REQUESTED id={session.id[:8]}")
         return {"ok": True, "message": "Stopping the stream and leaving voice."}
 
     async def handle_segment_event(self, body: dict):
@@ -363,11 +603,17 @@ class StreamManager:
             session.playback_updated_at = None
             if session.episode_results[episode]["error"]:
                 session.playback_state = "Failed"
+                self._event(
+                    f"PLAYBACK_ERROR id={session.id[:8]} episode={episode}: "
+                    f"{session.episode_results[episode]['error'][:240]}",
+                    "red",
+                )
             elif session.episode_results[episode]["skipped"]:
                 session.playback_state = "Skipped"
             else:
                 session.playback_elapsed = session.playback_duration
                 session.playback_state = "Finished"
+                self._event(f"EPISODE_FINISHED id={session.id[:8]} episode={episode}")
 
     async def handle_progress_event(self, body: dict):
         session = self.session
@@ -393,7 +639,17 @@ class StreamManager:
         session.playback_duration = duration
         session.playback_elapsed = min(elapsed, duration)
         session.playback_updated_at = time.monotonic()
+        if session.playback_state != "Streaming":
+            self._event(f"PLAYBACK_STARTED id={session.id[:8]} episode={episode}")
         session.playback_state = "Streaming"
+        bucket = int(elapsed // 30)
+        if bucket > session.last_terminal_progress:
+            session.last_terminal_progress = bucket
+            self._event(
+                f"PLAYBACK_PROGRESS id={session.id[:8]} episode={episode} "
+                f"{self._clock(elapsed)}/{self._clock(duration)} "
+                f"{min(100, int(elapsed * 100 / duration))}%"
+            )
 
     async def handle_series_event(self, body: dict):
         session = self.session
@@ -468,40 +724,23 @@ class StreamManager:
         terminal = "failed"
         error_text = ""
         prepared: PreparedEpisode | None = None
-        current_episode = session.request.start
+        current_episode = session.request.start - 1
+        join_task: asyncio.Task | None = None
         try:
-            session.phase = "Finding the best title match"
+            session.phase = "Finding uploaded anime in anime.json"
             session.playback_episode = session.request.start
-            session.playback_state = "Finding title"
+            session.playback_state = "Looking up Discord upload"
             session.status_started_at = time.monotonic()
             await self._start_progress_reporter(session)
-            mal_id, title, score = await resolve_anime(
-                session.request.query, self.root / "title_overrides.json"
+            self._event(
+                f"LOOKUP_LOCAL id={session.id[:8]} MAL={session.mal_id} "
+                f"range={session.request.start}-{session.request.end}"
             )
-            if session.stop_event.is_set():
-                terminal = "stopped"
-                return
-            session.mal_id, session.title = mal_id, title
-            session.phase = "Connecting to the voice channel"
-            session.playback_state = "Connecting"
-            session.status_started_at = time.monotonic()
-            await self._update_progress_message(session)
-            if provisional_title(title, mal_id):
-                title_message = (
-                    f"Title lookup is unavailable; continuing with MAL ID {mal_id} "
-                    f"and placeholder title `{title}`. Connecting the streaming account to voice…"
-                )
-            else:
-                title_message = (
-                    f"Matched **{title}** (MAL {mal_id}, match {score}%). "
-                    "Connecting the streaming account to your current voice channel…"
-                )
-            await self._send(session, title_message)
             session.card_directory = (
                 self.root / "downloads" / ".animax_cards" / session.id
             )
             episode = session.request.start
-            session.phase = f"Preparing E{episode} and connecting voice"
+            session.phase = f"Preparing E{episode} and joining voice"
             session.playback_episode = episode
             session.playback_state = "Connecting"
             session.playback_duration = 0.0
@@ -515,13 +754,29 @@ class StreamManager:
                 name=f"animax-first-episode-e{episode}",
             )
             session.prepare_task = first_task
-            await self.bridge.join(session.guild_id, session.voice_channel_id)
-            if not first_task.done() and not session.stop_event.is_set():
-                session.phase = f"Preparing E{episode}"
-                session.playback_state = "Preparing"
-                session.status_started_at = time.monotonic()
-                await self._update_progress_message(session)
-            prepared = await self._await_prepare(session, episode, first_task)
+            self._event(
+                f"VOICE_CONNECT id={session.id[:8]} guild={session.guild_id} "
+                f"channel={session.voice_channel_id}"
+            )
+            join_task = asyncio.create_task(
+                self.bridge.join(session.guild_id, session.voice_channel_id),
+                name=f"animax-stream-join-{session.id[:8]}",
+            )
+            done, _ = await asyncio.wait(
+                {first_task, join_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            prepared_first = None
+            first_consumed = False
+            if first_task in done:
+                prepared_first = await self._await_prepare(session, episode, first_task)
+                first_consumed = True
+            await join_task
+            join_task = None
+            self._event(f"VOICE_CONNECTED id={session.id[:8]}", "green")
+            if not first_consumed:
+                prepared_first = await self._await_prepare(session, episode, first_task)
+            prepared = prepared_first
+
             if prepared is SKIPPED:
                 session.playback_state = "Skipped"
                 session.status_started_at = None
@@ -542,9 +797,9 @@ class StreamManager:
 
             while episode <= session.request.end and not session.stop_event.is_set():
                 if prepared is None:
-                    session.phase = f"Preparing E{episode}"
+                    session.phase = f"Preparing E{episode} from anime.json"
                     session.playback_episode = episode
-                    session.playback_state = "Preparing"
+                    session.playback_state = "Looking up Discord upload"
                     session.playback_duration = 0.0
                     session.playback_elapsed = 0.0
                     session.playback_updated_at = None
@@ -575,6 +830,7 @@ class StreamManager:
                 if session.stop_event.is_set():
                     break
                 if not session.series_started:
+                    self._event(f"SERIES_START id={session.id[:8]} episode={episode}")
                     await self.bridge.series_start(
                         session.id,
                         session.guild_id,
@@ -607,6 +863,11 @@ class StreamManager:
                     prepared.duration,
                 )
                 await self._start_progress_reporter(session)
+                self._event(
+                    f"SEGMENT_QUEUED id={session.id[:8]} episode={episode} "
+                    f"language={prepared.language or 'unknown'} duration={self._clock(prepared.duration)} "
+                    f"message={prepared.message_id or 'cached'}"
+                )
 
                 next_task = None
                 next_episode = episode + 1
@@ -621,7 +882,7 @@ class StreamManager:
                     session.prefetch_started_at = time.monotonic()
                     if session.stop_event.is_set():
                         break
-                    session.phase = f"Streaming E{episode}; preparing E{next_episode}"
+                    session.phase = f"Streaming E{episode}; downloading E{next_episode}"
 
                 result = await self._wait_episode(session, episode)
                 if result.get("stopped") or session.stop_event.is_set():
@@ -633,10 +894,10 @@ class StreamManager:
                 prepared = None
 
                 if next_task:
-                    session.phase = f"Waiting for E{next_episode} to finish preparing"
+                    session.phase = f"Waiting for E{next_episode} to finish downloading"
                     if not next_task.done():
                         session.playback_episode = next_episode
-                        session.playback_state = "Preparing"
+                        session.playback_state = "Looking up Discord upload"
                         session.playback_duration = 0.0
                         session.playback_elapsed = 0.0
                         session.playback_updated_at = None
@@ -682,27 +943,40 @@ class StreamManager:
         except (TitleError, BridgeError, MediaError, OSError, ValueError) as exc:
             error_text = str(exc)
             log.exception("Stream session %s failed", session.id)
+            self._event(
+                f"FAILED id={session.id[:8]} type={type(exc).__name__}: {error_text[:500]}",
+                "red",
+            )
             terminal = "failed"
         except Exception as exc:
             error_text = str(exc)
             log.exception("Unexpected stream session failure %s", session.id)
+            self._event(
+                f"FAILED id={session.id[:8]} type={type(exc).__name__}: {error_text[:500]}",
+                "red",
+            )
             terminal = "failed"
         finally:
+            if join_task and not join_task.done():
+                join_task.cancel()
+                await asyncio.gather(join_task, return_exceptions=True)
             pending_episodes = {
-                episode
-                for episode in (session.preparing_episode, session.prefetch_episode)
-                if episode is not None
+                episode_id
+                for episode_id in (session.preparing_episode, session.prefetch_episode)
+                if episode_id is not None
             }
             for task in (session.prepare_task, session.prefetch_task):
                 if task and not task.done():
                     task.cancel()
-            pending = [t for t in (session.prepare_task, session.prefetch_task) if t]
+            pending = [
+                task for task in (session.prepare_task, session.prefetch_task) if task
+            ]
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
             if not self.settings.keep_stream_cache:
-                for episode in pending_episodes:
+                for episode_id in pending_episodes:
                     shutil.rmtree(
-                        self._episode_work(session, episode), ignore_errors=True
+                        self._episode_work(session, episode_id), ignore_errors=True
                     )
                 if prepared:
                     shutil.rmtree(prepared.work, ignore_errors=True)
@@ -736,37 +1010,36 @@ class StreamManager:
             session.progress_task = None
             if session.card_directory:
                 shutil.rmtree(session.card_directory, ignore_errors=True)
+            last_episode = (
+                session.current_episode
+                or session.preparing_episode
+                or session.playback_episode
+                or current_episode
+                or session.request.start
+            )
             session.current_episode = None
             session.preparing_episode = None
             session.prefetch_episode = None
+            session.download_episode = None
             session.phase = {
                 "finished": "Finished",
                 "stopped": "Stopped",
                 "failed": "Failed",
             }[terminal]
+            session.playback_episode = last_episode
             session.playback_state = session.phase
             session.playback_updated_at = None
-            if session.progress_message_text:
+            session.terminal_detail = error_text[:700] if terminal == "failed" else ""
+            if session.progress_message_text or session.progress_message is not None:
                 await self._update_progress_message(session)
-            if terminal == "failed":
-                await self._send(
-                    session,
-                    f"Stream stopped: {error_text[:900] or 'see logs/bot.log for details.'}",
-                )
-            elif terminal == "stopped":
-                await self._send(session, "Stream stopped; voice connection closed.")
-            else:
-                await self._send(
-                    session,
-                    f"Finished streaming **{session.title}** through Episode {current_episode}.",
-                )
-            log.info(
-                "STREAM_END id=%s status=%s mal=%s title=%s episode=%s",
-                session.id,
-                terminal,
-                session.mal_id,
-                session.title,
-                current_episode,
+            self._event(
+                f"END id={session.id[:8]} status={terminal} MAL={session.mal_id} "
+                f"episode={last_episode} error={error_text[:240]!r}",
+                "green"
+                if terminal == "finished"
+                else "yellow"
+                if terminal == "stopped"
+                else "red",
             )
 
     @staticmethod
@@ -792,108 +1065,235 @@ class StreamManager:
             disk_root=self.disk_root,
         )
 
-    def _episode_work(self, session: StreamSession, episode: int) -> Path:
+    def _episode_work(
+        self, session: StreamSession, episode: int, language: str | None = None
+    ) -> Path:
         if session.mal_id is None:
             raise MediaError(
                 "Cannot prepare an episode before anime metadata is resolved."
             )
-        skip_tag = "skip" if session.request.skip_intro_outro else "full"
+        track = (
+            language
+            or session.selected_languages.get(episode)
+            or session.request.language
+            or "auto"
+        )
         return (
             self.cache_root
             / f"mal-{session.mal_id}"
-            / f"{session.request.language}-e{episode:04d}-{skip_tag}"
+            / f"{track}-e{episode:04d}-discord"
         )
+
+    @staticmethod
+    def _read_cache_marker(work: Path, record: dict):
+        marker = work / "ready.json"
+        try:
+            data = json.loads(marker.read_text(encoding="utf-8"))
+            if (
+                data.get("version") != 1
+                or str(data.get("message_id")) != str(record["message_id"])
+                or str(data.get("channel_id")) != str(record["channel_id"])
+            ):
+                return None
+            path = work / str(data["file"])
+            if (
+                path.is_symlink()
+                or path.parent.resolve() != work.resolve()
+                or not path.is_file()
+            ):
+                return None
+            return path
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
 
     async def _prepare_episode(self, session: StreamSession, episode: int):
-        work = self._episode_work(session, episode)
-        work.mkdir(parents=True, exist_ok=True)
-        cfg = self.settings
-        cached = await cached_video(
-            work,
-            session.request.language,
-            1080,
-            "burn",
-            encoder_preset=STREAM_ENCODER_PRESET,
-            target_mb=cfg.target_mb,
-            video_crf=cfg.video_crf,
-            compression_mode=cfg.compression_mode,
-            compress_all=cfg.compress_all,
-            lossless=cfg.lossless,
-            caption_font=cfg.caption_font,
-            frame_rate=cfg.frame_rate,
-            skip_intro_outro=session.request.skip_intro_outro,
-        )
-        if cached:
-            path, note = cached
-            if note and not session.skip_notice_sent:
-                session.skip_notice_sent = True
-                await self._send(session, note[:900])
-            info = await probe(path)
-            return PreparedEpisode(
-                episode, work, path, float(info["format"]["duration"]), note
+        if session.mal_id is None:
+            raise MediaError(
+                "Cannot prepare an episode before anime metadata is resolved."
             )
-
-        async with Resolver(
-            timeout=cfg.resolve_timeout, headless=cfg.headless
-        ) as resolver:
-            async with resolve_with_fallback(
-                resolver,
-                session.mal_id,
-                session.request.language,
-                episode,
-                allow_fallback=cfg.dub_fallback,
-            ) as (stream, actual_language, fallback_reason):
-                if fallback_reason and not session.fallback_notice_sent:
-                    session.fallback_notice_sent = True
-                    await self._send(
-                        session,
-                        f"Dub or English dub captions were unavailable for E{episode}; falling back to sub. This notice is shown once per stream.",
-                    )
-                has_caption = choose_caption(stream.tracks, actual_language) is not None
-                if not has_caption and not session.caption_notice_sent:
-                    session.caption_notice_sent = True
-                    await self._send(
-                        session,
-                        f"No usable English captions were available for E{episode}; this episode will play without captions.",
-                    )
-                try:
-                    transfer = await stream.detach(
-                        actual_language, with_captions=has_caption
-                    )
-                except CaptionUnavailable:
-                    if not session.caption_notice_sent:
-                        session.caption_notice_sent = True
-                        await self._send(
-                            session,
-                            f"The English caption file was unavailable for E{episode}; this episode will play without captions.",
-                        )
-                    transfer = await stream.detach(actual_language, with_captions=False)
-                path, note = await download(
-                    transfer,
-                    work,
-                    actual_language,
-                    quality=1080,
-                    subtitle_mode="burn",
-                    max_bytes=cfg.max_temp_bytes,
-                    timeout=cfg.operation_timeout,
-                    request_interval=cfg.request_interval,
-                    encoder_preset=STREAM_ENCODER_PRESET,
-                    encode_threads=cfg.encode_threads,
-                    target_mb=cfg.target_mb,
-                    video_crf=cfg.video_crf,
-                    compression_mode=cfg.compression_mode,
-                    compress_all=cfg.compress_all,
-                    lossless=cfg.lossless,
-                    caption_font=cfg.caption_font,
-                    frame_rate=cfg.frame_rate,
-                    disk_root=self.disk_root,
-                    skip_intro_outro=session.request.skip_intro_outro,
-                    mal_id=session.mal_id,
-                    episode=episode,
+        library_data = getattr(self.library, "data", None)
+        if library_data is None:
+            raise MediaError("anime.json is unavailable to the stream manager.")
+        record = select_uploaded_episode(
+            library_data,
+            session.mal_id,
+            episode,
+            session.request.language,
+            preferred_guild_id=session.guild_id,
+            preferred_account_id=self.command_account_id,
+        )
+        language = record["language"]
+        session.selected_languages[episode] = language
+        work = self._episode_work(session, episode, language)
+        work.mkdir(parents=True, exist_ok=True, mode=0o700)
+        session.download_episode = episode
+        session.download_stage = "Checking saved Discord message"
+        session.download_received = 0
+        session.download_total = int(record.get("size_bytes") or 0)
+        session.download_started_at = time.monotonic()
+        session.download_last_log_percent = -10
+        foreground = (
+            session.current_episode is None or session.current_episode == episode
+        )
+        if foreground:
+            session.playback_episode = episode
+            session.playback_state = "Looking up Discord upload"
+            session.status_started_at = session.status_started_at or time.monotonic()
+        self._event(
+            f"EPISODE_LOOKUP id={session.id[:8]} MAL={session.mal_id} E{episode} "
+            f"language={language} channel={record['channel_id']} message={record['message_id']}"
+        )
+        cached = self._read_cache_marker(work, record)
+        if cached:
+            try:
+                info = await probe(cached)
+                duration = float(info["format"]["duration"])
+                session.download_episode = None
+                session.download_stage = ""
+                self._event(
+                    f"CACHE_HIT id={session.id[:8]} E{episode} message={record['message_id']} "
+                    f"file={cached.name} duration={self._clock(duration)}"
                 )
-                if note and not session.skip_notice_sent:
-                    session.skip_notice_sent = True
-                    await self._send(session, note[:900])
-        info = await probe(path)
+                return PreparedEpisode(
+                    episode,
+                    work,
+                    cached,
+                    duration,
+                    language=language,
+                    message_id=record["message_id"],
+                )
+            except (MediaError, OSError, ValueError):
+                self._event(
+                    f"CACHE_INVALID id={session.id[:8]} E{episode}; redownloading",
+                    "yellow",
+                )
+
+        if self.attachment_lookup is None:
+            raise MediaError(
+                "The main Discord account cannot fetch saved episode attachments."
+            )
+        try:
+            attachment = await asyncio.wait_for(
+                self.attachment_lookup(record),
+                timeout=min(120, self.settings.operation_timeout),
+            )
+        except asyncio.TimeoutError:
+            raise MediaError(
+                f"Timed out fetching saved Discord message {record['message_id']} for E{episode}."
+            ) from None
+        if not isinstance(attachment, dict):
+            raise MediaError(
+                "The main Discord account returned invalid attachment metadata."
+            )
+        if (
+            str(attachment.get("message_id") or record["message_id"])
+            != record["message_id"]
+        ):
+            raise MediaError(
+                "Discord returned an attachment from a different saved message."
+            )
+        url = str(attachment.get("url") or "")
+        if not url:
+            raise MediaError(
+                f"Saved Discord message {record['message_id']} has no video attachment URL."
+            )
+        filename = Path(str(attachment.get("filename") or "episode-video")).name
+        extension = attachment_extension(filename, attachment.get("content_type"))
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(filename).stem).strip("._-")[
+            :80
+        ]
+        if not safe_name:
+            safe_name = f"episode-{episode}"
+        destination = work / f"{safe_name}{extension}"
+        try:
+            attachment_size = int(
+                attachment.get("size") or record.get("size_bytes") or 0
+            )
+        except (TypeError, ValueError):
+            attachment_size = 0
+        session.download_stage = "Downloading"
+        session.download_received = 0
+        session.download_total = max(0, attachment_size)
+        if foreground:
+            session.playback_state = "Downloading from Discord"
+            session.status_started_at = time.monotonic()
+        self._event(
+            f"DOWNLOAD_START id={session.id[:8]} E{episode} language={language} "
+            f"message={record['message_id']} expected_bytes={attachment_size or 'unknown'}"
+        )
+
+        def progress(received: int, total: int):
+            session.download_received = received
+            if total > 0:
+                session.download_total = total
+            if foreground and session.current_episode is None:
+                session.playback_state = "Downloading from Discord"
+            if total > 0:
+                percent = min(100, int(received * 100 / total))
+                if percent >= session.download_last_log_percent + 10:
+                    session.download_last_log_percent = percent
+                    self._event(
+                        f"DOWNLOAD_PROGRESS id={session.id[:8]} E{episode} "
+                        f"{self._size_text(received)}/{self._size_text(total)} {percent}%"
+                    )
+
+        await download_discord_attachment(
+            url,
+            destination,
+            max_bytes=self.settings.max_temp_bytes,
+            timeout=self.settings.operation_timeout,
+            expected_size=attachment_size or None,
+            disk_root=self.disk_root,
+            on_progress=progress,
+        )
+        self._event(
+            f"FFPROBE_START id={session.id[:8]} E{episode} file={destination.name}"
+        )
+        playable, info = await ensure_playable(
+            destination,
+            max_bytes=self.settings.max_temp_bytes,
+            timeout=self.settings.operation_timeout,
+            disk_root=self.disk_root,
+        )
         duration = float(info["format"]["duration"])
-        return PreparedEpisode(episode, work, path, duration, note)
+        if playable != destination:
+            self._event(
+                f"FFMPEG_REPAIRED id={session.id[:8]} E{episode} file={playable.name}",
+                "yellow",
+            )
+        marker = {
+            "version": 1,
+            "mal_id": session.mal_id,
+            "episode": episode,
+            "language": language,
+            "message_id": record["message_id"],
+            "channel_id": record["channel_id"],
+            "file": playable.name,
+            "size_bytes": playable.stat().st_size,
+            "duration_seconds": duration,
+            "validated_at": time.time(),
+        }
+        marker_path = work / "ready.json"
+        marker_path.write_text(
+            json.dumps(marker, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        marker_path.chmod(0o600)
+        if playable != destination:
+            destination.unlink(missing_ok=True)
+        session.download_episode = None
+        session.download_stage = ""
+        session.download_received = 0
+        session.download_total = 0
+        self._event(
+            f"EPISODE_READY id={session.id[:8]} E{episode} language={language} "
+            f"duration={self._clock(duration)} bytes={playable.stat().st_size} "
+            f"message={record['message_id']}"
+        )
+        return PreparedEpisode(
+            episode,
+            work,
+            playable,
+            duration,
+            language=language,
+            message_id=record["message_id"],
+        )

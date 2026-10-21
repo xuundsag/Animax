@@ -43,6 +43,7 @@ from .routing import LogContext, Router, category_id
 from .scheduler import Entry, Scheduler
 from .settings import SAFE_OUTPUT_MB, Settings
 from .storage import Library
+from .stream_media import is_video_attachment
 from .stream_runtime import StreamRuntime
 from .terminal import Terminal, nice_error, setup_logging
 from .upload import JournalCommitFailure, UploadFailure, upload_episode
@@ -117,11 +118,71 @@ class MegaPlayBot(commands.Bot):
             )
         if self.stream_runtime is None:
             command_user_id = str(self.user.id) if self.user else None
+            self.ui.event(
+                "STREAM | Preparing the Go Live sidecar (separate account).", "cyan"
+            )
             self.stream_runtime = StreamRuntime(
-                self.stream_token, self.cfg, ROOT, command_user_id=command_user_id
+                self.stream_token,
+                self.cfg,
+                ROOT,
+                command_user_id=command_user_id,
+                library=self.library,
+                attachment_lookup=self.stream_attachment_for_record,
+                ui=self.ui,
             )
         self.stream_manager = await self.stream_runtime.start()
         return self.stream_manager
+
+    async def stream_attachment_for_record(self, record):
+        """Fetch the stored Discord message with the main command-only account."""
+        channel_id = str(record.get("channel_id") or "")
+        message_id = str(record.get("message_id") or "")
+        if not channel_id.isdecimal() or not message_id.isdecimal():
+            raise RuntimeError(
+                "anime.json contains an invalid upload channel/message ID."
+            )
+        try:
+            channel = await self.channel_for(channel_id)
+            message = await channel.fetch_message(int(message_id))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not fetch saved Discord message {message_id} from channel {channel_id} "
+                f"({type(exc).__name__}: {str(exc)[:240]}). Check that the main account can read that channel."
+            ) from exc
+
+        attachments = list(getattr(message, "attachments", ()) or ())
+        videos = [
+            attachment
+            for attachment in attachments
+            if is_video_attachment(
+                getattr(attachment, "filename", ""),
+                getattr(attachment, "content_type", None),
+            )
+        ]
+        if not videos:
+            raise RuntimeError(
+                f"Saved Discord message {message_id} has no recognizable video attachment."
+            )
+        attachment = max(videos, key=lambda item: int(getattr(item, "size", 0) or 0))
+        url = str(getattr(attachment, "url", "") or "")
+        if not url:
+            raise RuntimeError(
+                f"Discord returned no current attachment URL for saved message {message_id}."
+            )
+        self.ui.event(
+            f"STREAM | fetched anime.json message={message_id} channel={channel_id} "
+            f"file={getattr(attachment, 'filename', 'video')} "
+            f"size={int(getattr(attachment, 'size', 0) or 0)} bytes",
+            "cyan",
+        )
+        return {
+            "url": url,
+            "filename": str(getattr(attachment, "filename", "episode-video")),
+            "content_type": getattr(attachment, "content_type", None),
+            "size": int(getattr(attachment, "size", 0) or 0),
+            "message_id": str(message.id),
+            "channel_id": str(channel.id),
+        }
 
     async def get_context(self, origin, *, cls=CommandContext):
         return await super().get_context(origin, cls=cls)

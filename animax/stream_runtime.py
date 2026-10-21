@@ -7,9 +7,11 @@ import contextlib
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -77,19 +79,62 @@ def _sidecar_environment(
 
 
 def _run_timestamped(command, *, cwd: Path, timeout: int):
-    result = subprocess.run(
+    """Run setup commands while teeing each output line to the timestamped terminal."""
+    process = subprocess.Popen(
         command,
         cwd=cwd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        timeout=timeout,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
     )
-    for line in (result.stdout + result.stderr).splitlines():
-        print(f"[{time.strftime('%H:%M:%S')}] {line}", flush=True)
-    return result.returncode
+    lines = queue.Queue()
+
+    def read_output():
+        try:
+            for line in process.stdout:
+                lines.put(line.rstrip("\r\n"))
+        finally:
+            lines.put(None)
+
+    reader = threading.Thread(
+        target=read_output, name="animax-stream-setup-log", daemon=True
+    )
+    reader.start()
+    deadline = time.monotonic() + timeout
+    finished_reading = False
+    try:
+        while not finished_reading:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait()
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                line = lines.get(timeout=min(1, remaining))
+            except queue.Empty:
+                if process.poll() is not None and not reader.is_alive():
+                    break
+                continue
+            if line is None:
+                finished_reading = True
+            else:
+                print(f"[{time.strftime('%H:%M:%S')}] {line}", flush=True)
+        return process.wait(timeout=max(1, deadline - time.monotonic()))
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        reader.join(timeout=2)
 
 
 def _ensure_stream_dependencies(root: Path):
+    print(
+        f"[{time.strftime('%H:%M:%S')}] ANIMAX STREAM | Checking Node.js and FFmpeg...",
+        flush=True,
+    )
     node = shutil.which("node")
     if not node:
         raise RuntimeError(
@@ -115,16 +160,31 @@ def _ensure_stream_dependencies(root: Path):
         text=True,
         timeout=20,
     )
-    missing_filters = [
-        name for name in ("azmq", "subtitles") if name not in filters.stdout
-    ]
+    formats = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-formats"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    missing_filters = [name for name in ("drawtext",) if name not in filters.stdout]
     missing_encoders = [
         name for name in ("libx264", "aac") if name not in encoders.stdout
     ]
-    if filters.returncode or encoders.returncode or missing_filters or missing_encoders:
+    if (
+        filters.returncode
+        or encoders.returncode
+        or formats.returncode
+        or missing_filters
+        or missing_encoders
+        or "mpegts" not in formats.stdout
+    ):
         raise RuntimeError(
-            ".stream requires CPU FFmpeg with libx264, AAC, subtitles/libass and azmq/libzmq."
+            ".stream requires CPU FFmpeg with libx264, AAC, drawtext, and MPEG-TS support."
         )
+    print(
+        f"[{time.strftime('%H:%M:%S')}] ANIMAX STREAM | FFmpeg preflight passed.",
+        flush=True,
+    )
 
     if _package_versions_match(root):
         return
@@ -149,10 +209,21 @@ def _ensure_stream_dependencies(root: Path):
         )
 
 
-async def _read_node_stdout(process, ready: asyncio.Event, port_future):
+async def _read_node_stdout(process, ready: asyncio.Event, port_future, node_log=None):
+    """Print every Node stdout/stderr line live and retain a private sidecar log."""
     assert process.stdout is not None
     while line := await process.stdout.readline():
         text = line.decode("utf-8", "replace").strip()
+        if not text:
+            continue
+        timestamp = time.strftime("%H:%M:%S")
+        print(f"[{timestamp}] ANIMAX STREAM NODE | {text[:1200]}", flush=True)
+        if node_log is not None:
+            try:
+                node_log.write(f"[{timestamp}] {text}\n")
+                node_log.flush()
+            except (OSError, ValueError):
+                pass
         try:
             record = json.loads(text)
         except ValueError:
@@ -181,15 +252,32 @@ class StreamRuntime:
     """Own the local Python API and single Node Go Live session, started on first use."""
 
     def __init__(
-        self, token: str, settings, root: Path, *, command_user_id: str | None = None
+        self,
+        token: str,
+        settings,
+        root: Path,
+        *,
+        command_user_id: str | None = None,
+        library=None,
+        attachment_lookup=None,
+        ui=None,
     ):
         self.token = token
         self.command_user_id = str(command_user_id) if command_user_id else None
         self.settings = settings
         self.root = Path(root)
+        self.ui = ui
         self.secret = os.urandom(32).hex()
         self.bridge = StreamBridge("http://127.0.0.1:1", self.secret)
-        self.manager = StreamManager(settings, self.bridge, self.root)
+        self.manager = StreamManager(
+            settings,
+            self.bridge,
+            self.root,
+            library=library,
+            attachment_lookup=attachment_lookup,
+            ui=ui,
+            command_account_id=self.command_user_id,
+        )
         self.runner = None
         self.process = None
         self.process_wait = None
@@ -198,10 +286,20 @@ class StreamRuntime:
         self.started = False
         self._start_lock = asyncio.Lock()
 
+    def _event(self, message: str, style="cyan"):
+        log.info("STREAM_RUNTIME %s", message)
+        if self.ui is not None and hasattr(self.ui, "event"):
+            self.ui.event(f"STREAM | {message}", style)
+        else:
+            print(
+                f"[{time.strftime('%H:%M:%S')}] ANIMAX STREAM | {message}", flush=True
+            )
+
     async def start(self):
         async with self._start_lock:
             if self.started:
                 return self.manager
+            self._event("Checking stream runtime dependencies.")
             await asyncio.to_thread(_ensure_stream_dependencies, self.root)
             self.runner = web.AppRunner(
                 create_api(self.manager, self.secret), access_log=None
@@ -226,27 +324,39 @@ class StreamRuntime:
                     cwd=str(self.root),
                     env=environment,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=self.node_log,
+                    stderr=asyncio.subprocess.STDOUT,
                 )
                 ready = asyncio.Event()
                 port_future = asyncio.get_running_loop().create_future()
                 self.process_wait = asyncio.create_task(self.process.wait())
                 self.reader_task = asyncio.create_task(
-                    _read_node_stdout(self.process, ready, port_future)
+                    _read_node_stdout(self.process, ready, port_future, self.node_log)
                 )
+                self._event("Waiting for the streaming Discord account to log in.")
                 ready_wait = asyncio.create_task(ready.wait())
-                done, _ = await asyncio.wait(
-                    {self.process_wait, ready_wait},
-                    timeout=120,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if self.process_wait in done:
+                deadline = time.monotonic() + 120
+                while not ready_wait.done() and not self.process_wait.done():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    done, _ = await asyncio.wait(
+                        {self.process_wait, ready_wait},
+                        timeout=min(15, remaining),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        elapsed = int(120 - max(0, deadline - time.monotonic()))
+                        self._event(
+                            f"Still waiting for streaming account login ({elapsed}s).",
+                            "yellow",
+                        )
+                if self.process_wait.done():
                     ready_wait.cancel()
                     await asyncio.gather(ready_wait, return_exceptions=True)
                     raise RuntimeError(
                         f"Go Live sidecar exited during startup (code {self.process.returncode}); see logs/stream-bridge.log."
                     )
-                if ready_wait not in done:
+                if not ready_wait.done():
                     ready_wait.cancel()
                     await asyncio.gather(ready_wait, return_exceptions=True)
                     raise RuntimeError(
@@ -270,6 +380,10 @@ class StreamRuntime:
                 _validate_stream_health(health, self.command_user_id)
                 self.started = True
                 log.info(".stream Go Live sidecar is ready.")
+                self._event(
+                    f"Go Live sidecar ready as distinct user {health.get('userId')}; main DISCORD_TOKEN was not passed to Node.",
+                    "green",
+                )
                 return self.manager
             except BaseException:
                 await self.close()
@@ -288,10 +402,6 @@ class StreamRuntime:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(session.task, timeout=15)
 
-        if self.node_log:
-            with contextlib.suppress(Exception):
-                self.node_log.close()
-            self.node_log = None
         if self.process and self.process.returncode is None:
             self.process.terminate()
             try:
@@ -304,6 +414,10 @@ class StreamRuntime:
             self.reader_task.cancel()
             await asyncio.gather(self.reader_task, return_exceptions=True)
             self.reader_task = None
+        if self.node_log:
+            with contextlib.suppress(Exception):
+                self.node_log.close()
+            self.node_log = None
         if self.runner:
             await self.runner.cleanup()
             self.runner = None
