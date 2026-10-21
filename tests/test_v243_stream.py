@@ -72,6 +72,7 @@ class FakeBridge:
         self.started = []
         self.completed_at = {}
         self.skip_calls = []
+        self.control_calls = []
         self.messages = []
         self.edits = []
         self._completion_tasks = set()
@@ -110,6 +111,30 @@ class FakeBridge:
     async def series_skip(self, series_id, episode):
         self.skip_calls.append(episode)
         return {"ok": True}
+
+    async def series_pause(self, series_id):
+        self.control_calls.append(("pause", series_id))
+        return {"paused": True}
+
+    async def series_resume(self, series_id):
+        self.control_calls.append(("resume", series_id))
+        return {"paused": False}
+
+    async def series_seek(self, series_id, seconds):
+        self.control_calls.append(("seek", series_id, seconds))
+        return {"message": "Seek applied."}
+
+    async def series_skip_to(self, series_id, episode):
+        self.control_calls.append(("skipto", series_id, episode))
+        return {"ok": True}
+
+    async def series_volume(self, series_id, volume):
+        self.control_calls.append(("volume", series_id, volume))
+        return {"ok": True}
+
+    async def series_autopause(self, series_id, enabled):
+        self.control_calls.append(("autopause", series_id, enabled))
+        return {"paused": False, "enabled": enabled}
 
     async def series_end(self, series_id):
         await self.manager.handle_series_event({"seriesId": series_id})
@@ -344,9 +369,7 @@ async def test_attachment_downloader_streams_to_disk_and_rejects_untrusted_urls(
 
 
 @pytest.mark.asyncio
-async def test_status_message_is_created_by_main_client_and_keeps_progress_style(
-    tmp_path,
-):
+async def test_status_message_uses_timing_without_percentage(tmp_path):
     bridge = FakeBridge()
     status_message = FakeStatusMessage()
     manager = StreamManager(Settings(), bridge, tmp_path)
@@ -377,8 +400,9 @@ async def test_status_message_is_created_by_main_client_and_keeps_progress_style
                 "duration": 1440,
             }
         )
-        expected = "**One Piece** | `E1/2` | Streaming (DUB) | 0:10 / 24:00 (0%)"
+        expected = "**One Piece** | `E1/2` | Streaming (DUB) | 0:10 / 24:00"
         assert manager.status(1)["message"].startswith(expected)
+        assert "%" not in manager.status(1)["message"]
         await manager._update_progress_message(session)
         assert status_message.contents[-1].startswith(expected)
         assert bridge.messages == []
@@ -517,6 +541,91 @@ async def test_skip_cancels_the_prefetched_episode_at_a_boundary(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_stream_controls_pause_seek_skipto_volume_and_autopause(tmp_path):
+    bridge = FakeBridge()
+    manager = StreamManager(Settings(), bridge, tmp_path)
+    session = StreamSession(
+        "session",
+        1,
+        2,
+        3,
+        4,
+        parse_stream_request("21 1 3 dub"),
+        series_started=True,
+        current_episode=1,
+        playback_duration=120,
+        playback_elapsed=20,
+        playback_state="Streaming",
+        progress_message_id="status-1",
+    )
+    session.task = asyncio.create_task(asyncio.sleep(30))
+    manager.session = session
+    try:
+        paused = await manager.pause(guild_id=1, author_id=4)
+        assert paused["message"] == "Stream paused."
+        assert session.paused and session.playback_state == "Paused"
+
+        resumed = await manager.resume(guild_id=1, author_id=4)
+        assert resumed["message"] == "Stream resumed."
+        assert not session.paused and session.playback_state == "Streaming"
+
+        sought = await manager.seek(guild_id=1, author_id=4, seconds=10)
+        assert sought["message"] == "Seek applied."
+        assert await manager.skip_to(guild_id=1, author_id=4, episode=3) == {
+            "ok": True,
+            "message": "Jumping to E3.",
+        }
+        assert session.skip_to_episode == 3
+        assert await manager.set_volume(guild_id=1, author_id=4, volume=100) == {
+            "ok": True,
+            "message": "Stream volume set to 100%.",
+        }
+        assert session.volume == 100
+        assert await manager.set_autopause(guild_id=1, author_id=4, enabled=True) == {
+            "ok": True,
+            "message": "Autopause turned on.",
+        }
+        assert session.autopause_enabled
+        assert [call[0] for call in bridge.control_calls] == [
+            "pause",
+            "resume",
+            "seek",
+            "skipto",
+            "volume",
+            "autopause",
+        ]
+        with pytest.raises(StreamRequestError, match="0 to 100"):
+            await manager.set_volume(guild_id=1, author_id=4, volume=101)
+    finally:
+        session.task.cancel()
+        await asyncio.gather(session.task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_stream_controls_are_limited_to_the_stream_starter(tmp_path):
+    bridge = FakeBridge()
+    manager = StreamManager(Settings(), bridge, tmp_path)
+    session = StreamSession(
+        "session",
+        1,
+        2,
+        3,
+        4,
+        parse_stream_request("21 1 2"),
+        series_started=True,
+        current_episode=1,
+    )
+    session.task = asyncio.create_task(asyncio.sleep(30))
+    manager.session = session
+    try:
+        with pytest.raises(StreamRequestError, match="Only the command author"):
+            await manager.pause(guild_id=1, author_id=99)
+    finally:
+        session.task.cancel()
+        await asyncio.gather(session.task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_skip_control_is_limited_to_original_command_author(tmp_path):
     bridge = FakeBridge()
     manager = StreamManager(Settings(), bridge, tmp_path)
@@ -557,44 +666,28 @@ async def test_stop_is_limited_to_original_author_and_signals_session(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_stream_start_reservation_blocks_download_launch(tmp_path, monkeypatch):
+async def test_main_account_has_no_stream_controls_and_downloads_can_run_during_stream(
+    tmp_path, monkeypatch
+):
+    from unittest.mock import Mock
+
     from test_debug_release import build
 
     client, ctx, *_ = build(tmp_path, monkeypatch)
-    channel = SimpleNamespace(id=200)
-    member = SimpleNamespace(voice=SimpleNamespace(channel=channel))
-    ctx.guild = SimpleNamespace(id=100, get_member=lambda _user_id: member)
-    ctx.author = SimpleNamespace(id=123)
-    status_message = FakeStatusMessage()
-    ctx.send = AsyncMock(return_value=status_message)
-    manager = SimpleNamespace(
-        session=None,
-        start=AsyncMock(return_value={"message": "Stream starting."}),
-    )
-    entered = asyncio.Event()
-    release = asyncio.Event()
+    assert client.get_command("stream") is None
+    assert client.get_command("skip") is None
+    assert client.get_command("stop") is None
 
-    async def ensure_runtime():
-        client.stream_manager = manager
-        entered.set()
-        await release.wait()
-        return manager
-
-    client.ensure_stream_runtime = ensure_runtime
-    command = client.get_command("stream")
-    starting = asyncio.create_task(command.callback(ctx, request="21 1 1"))
-    await asyncio.wait_for(entered.wait(), timeout=2)
-    assert client.stream_starting
+    client.stream_starting = True
+    client.scheduler.enqueue = Mock(return_value=True)
+    ctx.send = AsyncMock()
     accepted = await client.launch_job(
         ctx, ctx.channel, Job(21, "dub", 1, 1, 456), False, fixed_target=ctx.channel
     )
-    assert accepted is False
-    assert "Go Live stream is active" in ctx.send.await_args.args[0]
-    release.set()
-    await asyncio.wait_for(starting, timeout=2)
-    assert not client.stream_starting
-    manager.start.assert_awaited_once()
-    assert manager.start.await_args.kwargs["progress_message"] is status_message
+    assert accepted is True
+    assert not any(
+        "Go Live stream is active" in str(call) for call in ctx.send.call_args_list
+    )
 
 
 @pytest.mark.asyncio

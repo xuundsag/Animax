@@ -7,8 +7,10 @@
     "node": ">=22.4.0"
   },
   "scripts": {
-    "check": "node --check animax/stream_bridge.mjs",
-    "test:feed": "node tests/stream_feed_smoke.mjs"
+    "check": "node --check animax/stream_bridge.mjs && node --check animax/stream_commands.mjs && node --check animax/stream_queue.mjs",
+    "test:feed": "node tests/stream_feed_smoke.mjs",
+    "test:commands": "node tests/test_stream_commands.mjs",
+    "test:queue": "node tests/test_stream_queue.mjs"
   },
   "dependencies": {
     "@dank074/discord-video-stream": "7.0.0",

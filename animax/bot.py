@@ -75,6 +75,7 @@ class MegaPlayBot(commands.Bot):
         self.stream_token = os.getenv("STREAM_DISCORD_TOKEN", "").strip()
         self.stream_runtime = None
         self.stream_manager = None
+        self.stream_listener_task = None
         self.stream_starting = False
         self.activity_lock = asyncio.Lock()
         self.cdn_cooldown = Cooldown(ROOT / "cdn_cooldown.json")
@@ -110,7 +111,7 @@ class MegaPlayBot(commands.Bot):
     async def ensure_stream_runtime(self):
         if not self.stream_token or self.stream_token.startswith("YOUR_"):
             raise RuntimeError(
-                "Set STREAM_DISCORD_TOKEN in .env to a separate streaming user account before using `.stream`."
+                "Set STREAM_DISCORD_TOKEN in .env to a separate streaming user account to enable the `?` command listener."
             )
         if self.stream_token == self.token:
             raise RuntimeError(
@@ -119,7 +120,8 @@ class MegaPlayBot(commands.Bot):
         if self.stream_runtime is None:
             command_user_id = str(self.user.id) if self.user else None
             self.ui.event(
-                "STREAM | Preparing the Go Live sidecar (separate account).", "cyan"
+                "STREAM | Starting the ? command listener and Go Live sidecar (separate account).",
+                "cyan",
             )
             self.stream_runtime = StreamRuntime(
                 self.stream_token,
@@ -128,6 +130,8 @@ class MegaPlayBot(commands.Bot):
                 command_user_id=command_user_id,
                 library=self.library,
                 attachment_lookup=self.stream_attachment_for_record,
+                voice_lookup=self.stream_voice_channel_for,
+                stream_guard=self.stream_guard,
                 ui=self.ui,
             )
         self.stream_manager = await self.stream_runtime.start()
@@ -184,6 +188,50 @@ class MegaPlayBot(commands.Bot):
             "channel_id": str(channel.id),
         }
 
+    def stream_guard(self):
+        if self.reset_task and not self.reset_task.done():
+            return "History reset is active; wait for it to finish before starting a stream."
+        if self.refetch_task and not self.refetch_task.done():
+            return "History refetch is active; wait for it to finish before starting a stream."
+        return None
+
+    async def stream_voice_channel_for(self, guild_id: int, author_id: int):
+        """Fallback voice-state lookup for a ?stream command when Node has no cached member."""
+        try:
+            guild = self.get_guild(int(guild_id)) or await self.fetch_guild(
+                int(guild_id)
+            )
+            member = guild.get_member(int(author_id))
+            if member is None:
+                member = await guild.fetch_member(int(author_id))
+            channel = getattr(getattr(member, "voice", None), "channel", None)
+            return int(channel.id) if channel is not None else None
+        except Exception as exc:
+            self.ui.event(
+                f"STREAM | could not resolve command author's voice channel ({type(exc).__name__})",
+                "yellow",
+            )
+            return None
+
+    async def start_stream_listener(self):
+        if not self.stream_token or self.stream_token.startswith("YOUR_"):
+            self.ui.event(
+                "STREAM | ? command listener disabled; set STREAM_DISCORD_TOKEN to a distinct account.",
+                "yellow",
+            )
+            return
+        self.stream_starting = True
+        try:
+            await self.ensure_stream_runtime()
+            self.ui.event("STREAM | ? command listener is ready.", "green")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("Could not start the stream-token command listener")
+            self.ui.error(exc)
+        finally:
+            self.stream_starting = False
+
     async def get_context(self, origin, *, cls=CommandContext):
         return await super().get_context(origin, cls=cls)
 
@@ -196,6 +244,12 @@ class MegaPlayBot(commands.Bot):
         if not self.startup_done:
             self.startup_done = True
             self.scheduler.configure()
+            if self.stream_token and (
+                self.stream_listener_task is None or self.stream_listener_task.done()
+            ):
+                self.stream_listener_task = asyncio.create_task(
+                    self.start_stream_listener(), name="animax-stream-command-listener"
+                )
             if self.cfg.auto_resume:
                 records = [
                     dict(r, id=k)
@@ -317,19 +371,6 @@ class MegaPlayBot(commands.Bot):
     ):
         language = language.lower()
         validate_request(mal_id, language, start, end, self.cfg.max_episodes)
-        if self.stream_starting or (
-            self.stream_manager and self.stream_manager.session
-        ):
-            task = (
-                self.stream_manager.session.task
-                if self.stream_manager and self.stream_manager.session
-                else None
-            )
-            if self.stream_starting or (task and not task.done()):
-                await ctx.send(
-                    "A Go Live stream is active. Wait for it to finish or use `.stop` before starting a download."
-                )
-                return
         if mode.lower() not in {"resume", "force"}:
             raise commands.BadArgument("Mode must be resume or force.")
         if not getattr(ctx, "guild", None):
@@ -388,11 +429,7 @@ class MegaPlayBot(commands.Bot):
         blocked = None
         accepted = False
         async with self.activity_lock:
-            session = self.stream_manager.session if self.stream_manager else None
-            stream_active = bool(session and session.task and not session.task.done())
-            if self.stream_starting or stream_active:
-                blocked = "A Go Live stream is active. Wait for it to finish or use `.stop` before starting a download."
-            elif any(
+            if any(
                 task is not None and not task.done()
                 for task in (self.reset_task, self.refetch_task)
             ):
@@ -1271,6 +1308,10 @@ class MegaPlayBot(commands.Bot):
                 await self.refetch_task
         if self.reset_task and not self.reset_task.done():
             await asyncio.shield(self.reset_task)
+        if self.stream_listener_task and not self.stream_listener_task.done():
+            self.stream_listener_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.stream_listener_task
         if self.stream_runtime:
             await self.stream_runtime.close()
         self.ui.finish()

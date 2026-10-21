@@ -4,6 +4,8 @@ import { once } from 'node:events';
 import { existsSync, lstatSync, realpathSync } from 'node:fs';
 import { isAbsolute, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
+import { STREAM_COMMAND_NAMES, STREAM_HELP, parseSeekSeconds, parseStreamCommand } from './stream_commands.mjs';
+import { SeriesQueue } from './stream_queue.mjs';
 import { Client } from '@lng2004/discord.js-selfbot-v13';
 import { Encoders, playStream, prepareStream, Streamer, Utils } from '@dank074/discord-video-stream';
 
@@ -68,13 +70,16 @@ function safeMediaPath(input) {
   return real;
 }
 
-async function* remuxToTransportStream(segment, offset, signal) {
+async function* remuxToTransportStream(segment, offset, signal, seekSeconds = 0, volume = 50) {
   const file = safeMediaPath(segment.filePath);
   const tag = `${segment.kind} E${segment.episode}`;
-  log(`FFMPEG_REMUX_START ${tag} file=${file} duration=${segment.duration}s`);
+  const audioVolume = Math.max(0, Math.min(100, Number(volume) || 0)) / 100;
+  log(`FFMPEG_REMUX_START ${tag} file=${file} duration=${segment.duration}s seek=${seekSeconds}s volume=${volume}%`);
+  const seekArgs = Number(seekSeconds) > 0 ? ['-ss', String(Number(seekSeconds))] : [];
   const args = [
-    '-hide_banner', '-loglevel', 'error', '-nostdin', '-re', '-i', file,
-    '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy',
+    '-hide_banner', '-loglevel', 'error', '-nostdin', ...seekArgs, '-re', '-i', file,
+    '-map', '0:v:0', '-map', '0:a:0?', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
+    '-af', `volume=${audioVolume.toFixed(2)}`,
     '-mpegts_flags', '+resend_headers+initial_discontinuity',
     '-muxdelay', '0', '-muxpreload', '0',
     '-output_ts_offset', String(Math.max(0, offset)),
@@ -108,131 +113,6 @@ async function* remuxToTransportStream(segment, offset, signal) {
   }
 }
 
-class SeriesQueue {
-  constructor(seriesId, signal) {
-    this.seriesId = seriesId;
-    this.signal = signal;
-    this.items = [];
-    this.waiters = [];
-    this.ended = false;
-    this.aborted = false;
-    this.active = null;
-    this.skipEpisodes = new Set();
-    this.offset = 0;
-  }
-
-  push(item) {
-    if (this.ended || this.aborted) throw new Error('The active stream queue is closed.');
-    const waiter = this.waiters.shift();
-    if (waiter) waiter(item);
-    else this.items.push(item);
-  }
-
-  close() {
-    this.ended = true;
-    for (const waiter of this.waiters.splice(0)) waiter(null);
-  }
-
-  abort() {
-    this.aborted = true;
-    this.close();
-    this.active?.controller?.abort(new Error('Stream stopped.'));
-  }
-
-  async take() {
-    while (!this.items.length && !this.ended && !this.aborted && !this.signal.aborted) {
-      const item = await new Promise((resolveItem) => this.waiters.push(resolveItem));
-      if (item) return item;
-    }
-    return this.items.shift() || null;
-  }
-
-  skipEpisode(episode) {
-    this.skipEpisodes.add(Number(episode));
-    if (this.active && this.active.episode === Number(episode) && this.active.kind === 'episode') {
-      this.active.controller.abort(new Error('Episode skipped.'));
-    }
-  }
-
-  async report(item, skipped = false, error = '') {
-    try {
-      await postPython('/internal/segment-event', {
-        seriesId: this.seriesId,
-        episode: item.episode,
-        kind: item.kind,
-        skipped,
-        error: String(error || '').slice(0, 1000),
-      });
-    } catch (exception) {
-      log('Could not notify Python about a completed stream segment.', exception);
-    }
-  }
-
-  async *stream() {
-    try {
-      while (!this.aborted && !this.signal.aborted) {
-        const item = await this.take();
-        if (!item) break;
-        if (item.kind === 'episode' && this.skipEpisodes.has(Number(item.episode))) {
-          this.skipEpisodes.delete(Number(item.episode));
-          await this.report(item, true, 'Skipped before playback.');
-          continue;
-        }
-        const controller = new AbortController();
-        const active = { ...item, controller, started: performance.now() };
-        this.active = active;
-        let skipped = false;
-        let failure = '';
-        let progressPending = false;
-        const reportProgress = async () => {
-          if (item.kind !== 'episode' || this.active !== active || progressPending) return;
-          progressPending = true;
-          const duration = Math.max(0, Number(item.duration) || 0);
-          const elapsed = Math.min(duration || Infinity, Math.max(0, (performance.now() - active.started) / 1000));
-          try {
-            await postPython('/internal/progress', {
-              seriesId: this.seriesId,
-              episode: item.episode,
-              kind: item.kind,
-              elapsed,
-              duration,
-            });
-          } catch (error) {
-            log('Could not report Go Live playback progress.', error);
-          } finally {
-            progressPending = false;
-          }
-        };
-        const progressTimer = item.kind === 'episode' ? setInterval(() => { void reportProgress(); }, 2000) : null;
-        try {
-          try {
-            if (progressTimer) void reportProgress();
-            for await (const chunk of remuxToTransportStream(item, this.offset, controller.signal)) {
-              if (this.aborted || this.signal.aborted) break;
-              yield chunk;
-            }
-            skipped = controller.signal.aborted && !this.signal.aborted && !this.aborted;
-          } catch (error) {
-            if (controller.signal.aborted && !this.signal.aborted && !this.aborted) skipped = true;
-            else if (this.signal.aborted || this.aborted) break;
-            else failure = String(error?.message || error);
-          }
-        } finally {
-          if (progressTimer) clearInterval(progressTimer);
-        }
-        const elapsed = Math.max(0, (performance.now() - active.started) / 1000);
-        this.offset += skipped ? Math.min(Number(item.duration) || elapsed, elapsed) : (Number(item.duration) || elapsed);
-        this.active = null;
-        if (item.kind === 'episode') this.skipEpisodes.delete(Number(item.episode));
-        await this.report(item, skipped, failure);
-        if (failure) throw new Error(failure);
-      }
-    } finally {
-      this.active?.controller?.abort(new Error('Series feed closed.'));
-      this.active = null;
-    }
-  }
-}
 
 const VOICE_JOIN_TIMEOUT_MS = 25000;
 
@@ -273,6 +153,26 @@ async function joinVoice(guildId, voiceChannelId) {
   }
 }
 
+function audiencePresent(state) {
+  const guild = client.guilds.cache.get(String(state.guildId));
+  const channel = client.channels.cache.get(String(state.voiceChannelId)) || guild?.channels.cache.get(String(state.voiceChannelId));
+  const members = channel?.members;
+  if (!members || typeof members.values !== 'function') return null;
+  const selfId = String(client.user?.id || '');
+  return [...members.values()].some((member) => String(member.id) !== selfId);
+}
+
+function refreshAutoPause(state) {
+  if (!state || !state.queue.autopauseEnabled) return;
+  const hasAudience = audiencePresent(state);
+  if (hasAudience === null) return;
+  const wasPaused = state.queue.paused;
+  state.queue.setAudience(hasAudience);
+  if (wasPaused !== state.queue.paused) {
+    log(`AUTOPAUSE series=${state.id} paused=${state.queue.paused} audience=${hasAudience}`);
+  }
+}
+
 async function startSeries(body) {
   if (activeSeries) throw new Error('A Go Live stream is already active.');
   const guildId = String(body.guildId || '');
@@ -281,14 +181,22 @@ async function startSeries(body) {
   await joinVoice(guildId, voiceChannelId);
   const controller = new AbortController();
   const seriesId = String(body.seriesId || `${Date.now()}`);
-  const queue = new SeriesQueue(seriesId, controller.signal);
+  const volume = Math.max(0, Math.min(100, Number(body.volume ?? 50)));
+  if (!Number.isFinite(volume)) throw new Error('Invalid stream volume.');
+  const autopause = Boolean(body.autopause);
+  const queue = new SeriesQueue(seriesId, controller.signal, {
+    volume, autopause, remux: remuxToTransportStream, postPython, logger: log,
+  });
   const profile = {
     bitrate: Math.max(2500, Math.min(8000, Number(body.bitrate || 5000))),
     threads: Math.max(1, Math.min(16, Number(body.threads || 2))),
     preset: ['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium'].includes(body.preset) ? body.preset : 'ultrafast',
   };
-  const state = { id: seriesId, guildId, voiceChannelId, queue, controller, profile, done: false, error: '' };
+  const state = { id: seriesId, guildId, voiceChannelId, queue, controller, profile, done: false, error: '', autoPauseTimer: null };
   activeSeries = state;
+  refreshAutoPause(state);
+  state.autoPauseTimer = setInterval(() => refreshAutoPause(state), 5000);
+  state.autoPauseTimer.unref?.();
   state.task = runSeries(state).catch((error) => {
     state.error = String(error?.stack || error);
     log(`Go Live series ${seriesId} failed.`, error);
@@ -333,6 +241,7 @@ async function runSeries(state) {
     if (!state.controller.signal.aborted) state.error = String(error?.stack || error);
   } finally {
     state.done = true;
+    if (state.autoPauseTimer) clearInterval(state.autoPauseTimer);
     state.queue.abort();
     try {
       await postPython('/internal/series-event', { seriesId: state.id, error: state.error });
@@ -359,6 +268,110 @@ async function editMessage(channelId, messageId, content) {
   }
   await message.edit(String(content || '').slice(0, 1900));
   return { messageId: String(message.id) };
+}
+
+async function memberVoiceChannelId(message) {
+  let member = message.member;
+  let channelId = member?.voice?.channelId || member?.voice?.channel?.id || null;
+  if (!channelId && message.guild?.members?.fetch) {
+    try {
+      member = await message.guild.members.fetch(String(message.author.id));
+      channelId = member?.voice?.channelId || member?.voice?.channel?.id || null;
+    } catch (error) {
+      log(`Could not fetch command author's voice state for ${message.author.id}.`, error);
+    }
+  }
+  return channelId ? String(channelId) : null;
+}
+
+
+async function handleStreamCommand(message) {
+  const parsed = parseStreamCommand(message?.content);
+  if (!parsed) return;
+  if (message.author?.bot && String(message.author.id) !== String(client.user?.id)) return;
+  const { name, args } = parsed;
+  if (!STREAM_COMMAND_NAMES.includes(name)) {
+    await message.channel.send('Unknown stream command. Use `?help`.');
+    return;
+  }
+  log(`COMMAND name=${name} author=${message.author.id} guild=${message.guild?.id || 'DM'} channel=${message.channel?.id || 'unknown'}`);
+  if (name === 'help') {
+    await message.channel.send(STREAM_HELP);
+    return;
+  }
+  if (!message.guild || !message.channel?.send) {
+    await message.channel.send('Use stream commands in a server text channel.');
+    return;
+  }
+  const guildId = String(message.guild.id);
+  const authorId = String(message.author.id);
+  const channelId = String(message.channel.id);
+
+  if (name === 'stream') {
+    if (!args) {
+      await message.channel.send('Usage: `?stream <MAL ID or anime title> <start> <end> [sub|dub]`.');
+      return;
+    }
+    let statusMessage;
+    try {
+      statusMessage = await message.channel.send('**Go Live** | `Starting` | 0:00 / --:--');
+      const voiceChannelId = await memberVoiceChannelId(message);
+      const result = await postPython('/stream/start', {
+        guildId,
+        voiceChannelId,
+        channelId,
+        authorId,
+        raw: args,
+        progressMessageId: String(statusMessage.id),
+      });
+      log(`STREAM_REQUEST accepted author=${authorId} guild=${guildId} message=${statusMessage.id}`);
+      return result;
+    } catch (error) {
+      const text = `**Go Live** | \`Failed\` | 0:00 / --:--\n${String(error?.message || error).slice(0, 1200)}`;
+      if (statusMessage) {
+        await statusMessage.edit(text.slice(0, 1900)).catch(() => {});
+      } else {
+        await message.channel.send(text.slice(0, 1900)).catch(() => {});
+      }
+      log(`STREAM_REQUEST failed author=${authorId}.`, error);
+      return null;
+    }
+  }
+
+  let value = null;
+  try {
+    if (name === 'forward' || name === 'backward') {
+      value = parseSeekSeconds(args);
+    } else if (name === 'skipto') {
+      if (!/^\d+$/.test(args)) throw new Error('Usage: `?skipto <episode number>`.');
+      value = Number(args);
+      if (!Number.isSafeInteger(value) || value < 1) throw new Error('Episode number must be positive.');
+    } else if (name === 'volume') {
+      if (args) {
+        if (!/^\d{1,3}$/.test(args)) throw new Error('Usage: `?volume [0-100]`.');
+        value = Number(args);
+        if (value > 100) throw new Error('Volume must be from 0 to 100.');
+      }
+    } else if (name === 'autopause') {
+      if (args) {
+        const option = args.toLowerCase();
+        if (!['on', 'off'].includes(option)) throw new Error('Usage: `?autopause on|off`.');
+        value = option === 'on';
+      }
+    } else if (args) {
+      throw new Error(`Usage: \`?${name}\` takes no arguments.`);
+    }
+    const result = await postPython('/stream/control', {
+      guildId,
+      authorId,
+      command: name,
+      value,
+    });
+    await message.channel.send(String(result.message || 'Stream command completed.'));
+  } catch (error) {
+    await message.channel.send(String(error?.message || error).slice(0, 1800)).catch(() => {});
+    log(`COMMAND failed name=${name} author=${authorId}.`, error);
+  }
 }
 
 async function handleApi(request, response) {
@@ -410,6 +423,45 @@ async function handleApi(request, response) {
         if (!activeSeries || activeSeries.id !== String(body.seriesId)) throw new Error('No matching active stream.');
         activeSeries.queue.skipEpisode(Number(body.episode));
         return json(response, 200, { ok: true });
+      case '/api/series/pause': {
+        if (!activeSeries || activeSeries.id !== String(body.seriesId)) throw new Error('No matching active stream.');
+        const result = activeSeries.queue.pause();
+        log(`PAUSE series=${activeSeries.id}`);
+        return json(response, 200, { ok: true, ...result });
+      }
+      case '/api/series/resume': {
+        if (!activeSeries || activeSeries.id !== String(body.seriesId)) throw new Error('No matching active stream.');
+        const result = activeSeries.queue.resume();
+        log(`RESUME series=${activeSeries.id} paused=${result.paused}`);
+        return json(response, 200, { ok: true, ...result });
+      }
+      case '/api/series/seek': {
+        if (!activeSeries || activeSeries.id !== String(body.seriesId)) throw new Error('No matching active stream.');
+        const result = activeSeries.queue.seek(Number(body.seconds));
+        const position = Math.floor(result.position);
+        const timing = `${Math.floor(position / 60)}:${String(position % 60).padStart(2, '0')}`;
+        log(`SEEK series=${activeSeries.id} position=${result.position.toFixed(2)}s`);
+        return json(response, 200, { ok: true, ...result, message: `Seeked to ${timing}.` });
+      }
+      case '/api/series/skipto': {
+        if (!activeSeries || activeSeries.id !== String(body.seriesId)) throw new Error('No matching active stream.');
+        const result = await activeSeries.queue.skipTo(Number(body.episode));
+        log(`SKIP_TO series=${activeSeries.id} episode=${result.target}`);
+        return json(response, 200, { ok: true, ...result });
+      }
+      case '/api/series/volume': {
+        if (!activeSeries || activeSeries.id !== String(body.seriesId)) throw new Error('No matching active stream.');
+        const result = activeSeries.queue.setVolume(Number(body.volume));
+        log(`VOLUME series=${activeSeries.id} value=${result.volume}`);
+        return json(response, 200, { ok: true, ...result });
+      }
+      case '/api/series/autopause': {
+        if (!activeSeries || activeSeries.id !== String(body.seriesId)) throw new Error('No matching active stream.');
+        const hasAudience = audiencePresent(activeSeries);
+        const result = activeSeries.queue.setAutopause(Boolean(body.enabled), hasAudience ?? true);
+        log(`AUTOPAUSE_CONFIG series=${activeSeries.id} enabled=${result.enabled} paused=${result.paused}`);
+        return json(response, 200, { ok: true, ...result });
+      }
       case '/api/series/end':
         if (!activeSeries || activeSeries.id !== String(body.seriesId)) throw new Error('No matching active stream.');
         activeSeries.queue.close();
@@ -454,6 +506,16 @@ client.once('ready', () => {
   console.log(JSON.stringify({ event: 'discord-ready', userId: client.user?.id, timestamp: new Date().toISOString() }));
 });
 client.on('error', (error) => log('Discord client error.', error));
+client.on('messageCreate', (message) => {
+  void handleStreamCommand(message).catch((error) => log('Stream command handler failed.', error));
+});
+client.on('voiceStateUpdate', (oldState, newState) => {
+  const guildId = String(newState?.guild?.id || oldState?.guild?.id || '');
+  const state = activeSeries;
+  if (!state || guildId !== String(state.guildId) || !state.queue.autopauseEnabled) return;
+  const timer = setTimeout(() => refreshAutoPause(state), 300);
+  timer.unref?.();
+});
 process.on('unhandledRejection', (error) => log('Unhandled rejection.', error));
 process.on('uncaughtException', (error) => { log('Uncaught exception.', error); process.exitCode = 1; });
 

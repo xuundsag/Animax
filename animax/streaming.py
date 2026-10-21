@@ -34,6 +34,7 @@ log = logging.getLogger("animax.streaming")
 ROOT = Path(__file__).resolve().parent.parent
 SKIPPED = object()
 STREAM_ENCODER_PRESET = "ultrafast"
+STREAM_ENCODER_THREADS = 2
 
 
 class StreamRequestError(ValueError):
@@ -205,7 +206,7 @@ def parse_stream_request(raw: str) -> StreamRequest:
         raise StreamRequestError(f"Could not parse the command: {exc}") from None
     if len(tokens) < 3:
         raise StreamRequestError(
-            "Usage: `.stream <MAL ID or anime name> <start episode> <end episode> [sub|dub]`."
+            "Usage: `?stream <MAL ID or anime name> <start episode> <end episode> [sub|dub]`."
         )
 
     language = None
@@ -297,6 +298,11 @@ class StreamSession:
     terminal_detail: str = ""
     started_at: float | None = None
     last_terminal_progress: int = -1
+    join_task: asyncio.Task | None = None
+    skip_to_episode: int | None = None
+    volume: int = 50
+    autopause_enabled: bool = False
+    paused: bool = False
 
 
 class StreamManager:
@@ -308,6 +314,8 @@ class StreamManager:
         *,
         library=None,
         attachment_lookup=None,
+        voice_lookup=None,
+        stream_guard=None,
         ui=None,
         command_account_id: int | str | None = None,
     ):
@@ -318,6 +326,8 @@ class StreamManager:
         self.disk_root = self.root / "downloads"
         self.library = library
         self.attachment_lookup = attachment_lookup
+        self.voice_lookup = voice_lookup
+        self.stream_guard = stream_guard
         self.ui = ui
         self.command_account_id = (
             str(command_account_id) if command_account_id else None
@@ -396,12 +406,28 @@ class StreamManager:
         self,
         *,
         guild_id: int,
-        voice_channel_id: int,
+        voice_channel_id: int | None,
         text_channel_id: int,
         author_id: int,
         raw: str,
         progress_message=None,
+        progress_message_id: str | None = None,
     ):
+        if self.stream_guard is not None:
+            reason = self.stream_guard()
+            if reason:
+                raise StreamRequestError(str(reason))
+        if not voice_channel_id and self.voice_lookup is not None:
+            try:
+                voice_channel_id = await asyncio.wait_for(
+                    self.voice_lookup(int(guild_id), int(author_id)), timeout=12
+                )
+            except asyncio.TimeoutError:
+                raise StreamRequestError(
+                    "Timed out checking the command author's voice channel."
+                ) from None
+        if not voice_channel_id:
+            raise StreamRequestError("Join a voice channel before using `?stream`.")
         request = parse_stream_request(raw)
         library_data = getattr(self.library, "data", None)
         if library_data is None:
@@ -412,7 +438,7 @@ class StreamManager:
         async with self.lock:
             if self.session and self.session.task and not self.session.task.done():
                 raise StreamBusy(
-                    "ANIMAX already has an active Go Live stream. Use `.status` or `.stop`."
+                    "ANIMAX already has an active Go Live stream. Use `?stop` or wait for it to finish."
                 )
             session = StreamSession(
                 id=uuid.uuid4().hex,
@@ -425,6 +451,10 @@ class StreamManager:
                 title=title,
                 playback_episode=request.start,
                 progress_message=progress_message,
+                progress_message_id=(
+                    str(progress_message_id) if progress_message_id else None
+                ),
+                volume=50,
                 started_at=time.monotonic(),
                 status_started_at=time.monotonic(),
             )
@@ -471,17 +501,14 @@ class StreamManager:
             elapsed += max(0.0, time.monotonic() - session.playback_updated_at)
         if duration > 0:
             elapsed = min(duration, elapsed)
-            timing = (
-                f"{self._clock(elapsed)} / {self._clock(duration)} "
-                f"({min(100, int(elapsed * 100 / duration))}%)"
-            )
+            timing = f"{self._clock(elapsed)} / {self._clock(duration)}"
         else:
             stage_elapsed = (
                 max(0.0, time.monotonic() - session.status_started_at)
                 if session.status_started_at
                 else 0.0
             )
-            timing = f"{self._clock(stage_elapsed)} / --:-- (0%)"
+            timing = f"{self._clock(stage_elapsed)} / --:--"
 
         title = discord.utils.escape_markdown(session.title or session.request.query)
         state = session.playback_state
@@ -496,13 +523,9 @@ class StreamManager:
             download_episode = session.download_episode
             stage = session.download_stage or "Looking up Discord upload"
             if stage == "Downloading" and session.download_total > 0:
-                percent = min(
-                    100,
-                    int(session.download_received * 100 / session.download_total),
-                )
                 detail = (
                     f"{self._size_text(session.download_received)} / "
-                    f"{self._size_text(session.download_total)} ({percent}%)"
+                    f"{self._size_text(session.download_total)}"
                 )
             elif stage == "Downloading":
                 detail = f"{self._size_text(session.download_received)} downloaded"
@@ -514,11 +537,7 @@ class StreamManager:
                     f"{stage} | {timing}"
                 )
                 if session.download_total > 0:
-                    percent = min(
-                        100,
-                        int(session.download_received * 100 / session.download_total),
-                    )
-                    content += f" · {self._size_text(session.download_received)} / {self._size_text(session.download_total)} ({percent}%)"
+                    content += f" · {self._size_text(session.download_received)} / {self._size_text(session.download_total)}"
             else:
                 content += f"\n↳ E{download_episode} download | {detail}"
 
@@ -572,10 +591,148 @@ class StreamManager:
             }
         return {"ok": True, "message": "There is no active episode to skip yet."}
 
+    async def pause(self, *, guild_id: int, author_id: int):
+        session = self._authorize_session(guild_id, author_id)
+        if not session.series_started:
+            raise StreamRequestError(
+                "Playback has not started yet; try `?pause` again shortly."
+            )
+        if session.paused:
+            return {"ok": True, "message": "Playback is already paused."}
+        result = await self.bridge.series_pause(session.id)
+        session.paused = bool(result.get("paused", True))
+        session.playback_state = "Paused" if session.paused else "Streaming"
+        session.playback_updated_at = None if session.paused else time.monotonic()
+        await self._update_progress_message(session)
+        self._event(f"PAUSE id={session.id[:8]}")
+        return {
+            "ok": True,
+            "message": "Stream paused."
+            if session.paused
+            else "Autopause kept playback paused.",
+        }
+
+    async def resume(self, *, guild_id: int, author_id: int):
+        session = self._authorize_session(guild_id, author_id)
+        if not session.series_started:
+            raise StreamRequestError(
+                "Playback has not started yet; try `?resume` again shortly."
+            )
+        result = await self.bridge.series_resume(session.id)
+        session.paused = bool(result.get("paused", False))
+        session.playback_state = "Paused" if session.paused else "Streaming"
+        session.playback_updated_at = None if session.paused else time.monotonic()
+        await self._update_progress_message(session)
+        self._event(f"RESUME id={session.id[:8]} paused={session.paused}")
+        message = (
+            "Autopause is waiting for someone to rejoin."
+            if session.paused
+            else "Stream resumed."
+        )
+        return {"ok": True, "message": message}
+
+    async def seek(self, *, guild_id: int, author_id: int, seconds: float):
+        session = self._authorize_session(guild_id, author_id)
+        if not session.series_started or session.current_episode is None:
+            raise StreamRequestError(
+                "Seeking is available after the current episode starts."
+            )
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            raise StreamRequestError(
+                "Seek offset must be a number of seconds."
+            ) from None
+        if not math.isfinite(seconds) or abs(seconds) > 7200:
+            raise StreamRequestError("Seek offset must be within two hours.")
+        result = await self.bridge.series_seek(session.id, seconds)
+        return {"ok": True, "message": result.get("message", "Seek applied.")}
+
+    async def skip_to(self, *, guild_id: int, author_id: int, episode: int):
+        session = self._authorize_session(guild_id, author_id)
+        try:
+            episode = int(episode)
+        except (TypeError, ValueError):
+            raise StreamRequestError("Episode number must be a whole number.") from None
+        if not session.request.start <= episode <= session.request.end:
+            raise StreamRequestError(
+                f"Choose an episode within the requested range E{session.request.start}–E{session.request.end}."
+            )
+        if session.current_episode == episode or session.preparing_episode == episode:
+            return {"ok": True, "message": f"Already on E{episode}."}
+        session.skip_to_episode = episode
+        if session.current_episode is not None and session.series_started:
+            if (
+                session.prefetch_episode is not None
+                and session.prefetch_episode != episode
+                and session.prefetch_task
+                and not session.prefetch_task.done()
+            ):
+                session.skip_preparing.add(session.prefetch_episode)
+                session.prefetch_task.cancel()
+            await self.bridge.series_skip_to(session.id, episode)
+            self._event(f"SKIP_TO id={session.id[:8]} episode={episode}")
+            return {"ok": True, "message": f"Jumping to E{episode}."}
+        preparing_episode = session.preparing_episode or session.prefetch_episode
+        task = session.prepare_task or session.prefetch_task
+        if (
+            preparing_episode is not None
+            and preparing_episode != episode
+            and task
+            and not task.done()
+        ):
+            session.skip_preparing.add(preparing_episode)
+            task.cancel()
+        self._event(f"SKIP_TO_PREPARATION id={session.id[:8]} episode={episode}")
+        return {"ok": True, "message": f"Preparing to jump to E{episode}."}
+
+    async def set_volume(
+        self, *, guild_id: int, author_id: int, volume: int | None = None
+    ):
+        session = self._authorize_session(guild_id, author_id)
+        if volume is None:
+            return {"ok": True, "message": f"Current stream volume: {session.volume}%."}
+        try:
+            volume = int(volume)
+        except (TypeError, ValueError):
+            raise StreamRequestError(
+                "Volume must be a whole number from 0 to 100."
+            ) from None
+        if not 0 <= volume <= 100:
+            raise StreamRequestError("Volume must be from 0 to 100.")
+        session.volume = volume
+        if session.series_started:
+            await self.bridge.series_volume(session.id, volume)
+        self._event(f"VOLUME id={session.id[:8]} value={volume}")
+        return {"ok": True, "message": f"Stream volume set to {volume}%."}
+
+    async def set_autopause(
+        self, *, guild_id: int, author_id: int, enabled: bool | None = None
+    ):
+        session = self._authorize_session(guild_id, author_id)
+        if enabled is None:
+            state = "on" if session.autopause_enabled else "off"
+            return {"ok": True, "message": f"Autopause is {state}."}
+        session.autopause_enabled = bool(enabled)
+        result = {"paused": session.paused}
+        if session.series_started:
+            result = await self.bridge.series_autopause(
+                session.id, session.autopause_enabled
+            )
+            session.paused = bool(result.get("paused", session.paused))
+            session.playback_state = "Paused" if session.paused else "Streaming"
+            session.playback_updated_at = None if session.paused else time.monotonic()
+            await self._update_progress_message(session)
+        self._event(
+            f"AUTOPAUSE id={session.id[:8]} enabled={session.autopause_enabled}"
+        )
+        state = "on" if session.autopause_enabled else "off"
+        return {"ok": True, "message": f"Autopause turned {state}."}
+
     async def stop(self, *, guild_id: int, author_id: int):
         session = self._authorize_session(guild_id, author_id)
         session.stop_event.set()
-        for task in (session.prepare_task, session.prefetch_task):
+        for task in (session.prepare_task, session.prefetch_task, session.join_task):
             if task and not task.done():
                 task.cancel()
         if session.series_started:
@@ -638,10 +795,14 @@ class StreamManager:
         session.playback_episode = episode
         session.playback_duration = duration
         session.playback_elapsed = min(elapsed, duration)
-        session.playback_updated_at = time.monotonic()
-        if session.playback_state != "Streaming":
-            self._event(f"PLAYBACK_STARTED id={session.id[:8]} episode={episode}")
-        session.playback_state = "Streaming"
+        session.paused = bool(body.get("paused", session.paused))
+        session.playback_updated_at = None if session.paused else time.monotonic()
+        if session.paused:
+            session.playback_state = "Paused"
+        else:
+            if session.playback_state != "Streaming":
+                self._event(f"PLAYBACK_STARTED id={session.id[:8]} episode={episode}")
+            session.playback_state = "Streaming"
         bucket = int(elapsed // 30)
         if bucket > session.last_terminal_progress:
             session.last_terminal_progress = bucket
@@ -762,6 +923,7 @@ class StreamManager:
                 self.bridge.join(session.guild_id, session.voice_channel_id),
                 name=f"animax-stream-join-{session.id[:8]}",
             )
+            session.join_task = join_task
             done, _ = await asyncio.wait(
                 {first_task, join_task}, return_when=asyncio.FIRST_COMPLETED
             )
@@ -772,6 +934,7 @@ class StreamManager:
                 first_consumed = True
             await join_task
             join_task = None
+            session.join_task = None
             self._event(f"VOICE_CONNECTED id={session.id[:8]}", "green")
             if not first_consumed:
                 prepared_first = await self._await_prepare(session, episode, first_task)
@@ -781,7 +944,11 @@ class StreamManager:
                 session.playback_state = "Skipped"
                 session.status_started_at = None
                 await self._update_progress_message(session)
-                episode += 1
+                if session.skip_to_episode is not None:
+                    episode = session.skip_to_episode
+                    session.skip_to_episode = None
+                else:
+                    episode += 1
                 prepared = None
             elif prepared is not None:
                 if session.stop_event.is_set():
@@ -796,6 +963,14 @@ class StreamManager:
                     await self._update_progress_message(session)
 
             while episode <= session.request.end and not session.stop_event.is_set():
+                if session.skip_to_episode is not None:
+                    target = session.skip_to_episode
+                    session.skip_to_episode = None
+                    if prepared is not None and prepared.episode != target:
+                        if not self.settings.keep_stream_cache:
+                            shutil.rmtree(prepared.work, ignore_errors=True)
+                        prepared = None
+                    episode = target
                 if prepared is None:
                     session.phase = f"Preparing E{episode} from anime.json"
                     session.playback_episode = episode
@@ -816,7 +991,11 @@ class StreamManager:
                         session.playback_state = "Skipped"
                         session.status_started_at = None
                         await self._update_progress_message(session)
-                        episode += 1
+                        if session.skip_to_episode is not None:
+                            episode = session.skip_to_episode
+                            session.skip_to_episode = None
+                        else:
+                            episode += 1
                         continue
                     if prepared is None or session.stop_event.is_set():
                         break
@@ -836,8 +1015,10 @@ class StreamManager:
                         session.guild_id,
                         session.voice_channel_id,
                         bitrate=self.settings.stream_bitrate_kbps,
-                        threads=self.settings.encode_threads,
+                        threads=STREAM_ENCODER_THREADS,
                         preset=STREAM_ENCODER_PRESET,
+                        volume=session.volume,
+                        autopause=session.autopause_enabled,
                     )
                     session.series_started = True
                 session.current_episode = episode
@@ -893,6 +1074,45 @@ class StreamManager:
                     shutil.rmtree(prepared.work, ignore_errors=True)
                 prepared = None
 
+                jump_target = session.skip_to_episode
+                if jump_target is not None:
+                    session.skip_to_episode = None
+                    next_prepared = None
+                    if next_task:
+                        if jump_target != next_episode and not next_task.done():
+                            session.skip_preparing.add(next_episode)
+                            next_task.cancel()
+                        try:
+                            next_prepared = await self._await_prepare(
+                                session, next_episode, next_task
+                            )
+                        except Exception:
+                            if jump_target == next_episode:
+                                raise
+                    if jump_target == next_episode and isinstance(
+                        next_prepared, PreparedEpisode
+                    ):
+                        prepared = next_prepared
+                    else:
+                        if (
+                            isinstance(next_prepared, PreparedEpisode)
+                            and not self.settings.keep_stream_cache
+                        ):
+                            shutil.rmtree(next_prepared.work, ignore_errors=True)
+                        prepared = None
+                    episode = jump_target
+                    session.playback_episode = jump_target
+                    if prepared is not None:
+                        session.playback_state = "Starting"
+                        session.playback_duration = prepared.duration
+                        session.status_started_at = None
+                    else:
+                        session.playback_state = "Looking up Discord upload"
+                        session.playback_duration = 0.0
+                        session.status_started_at = time.monotonic()
+                    await self._update_progress_message(session)
+                    continue
+
                 if next_task:
                     session.phase = f"Waiting for E{next_episode} to finish downloading"
                     if not next_task.done():
@@ -913,7 +1133,11 @@ class StreamManager:
                         session.playback_state = "Skipped"
                         session.status_started_at = None
                         await self._update_progress_message(session)
-                        episode = next_episode + 1
+                        if session.skip_to_episode is not None:
+                            episode = session.skip_to_episode
+                            session.skip_to_episode = None
+                        else:
+                            episode = next_episode + 1
                         continue
                     if next_prepared is None:
                         break
@@ -960,6 +1184,7 @@ class StreamManager:
             if join_task and not join_task.done():
                 join_task.cancel()
                 await asyncio.gather(join_task, return_exceptions=True)
+            session.join_task = None
             pending_episodes = {
                 episode_id
                 for episode_id in (session.preparing_episode, session.prefetch_episode)

@@ -59,13 +59,17 @@ def create_api(manager: StreamManager, secret: str):
 
     async def start_stream(request):
         data = await body(request)
+        voice_channel = str(data.get("voiceChannelId") or "")
         return json_response(
             await manager.start(
                 guild_id=int(data["guildId"]),
-                voice_channel_id=int(data["voiceChannelId"]),
+                voice_channel_id=int(voice_channel)
+                if voice_channel.isdecimal()
+                else None,
                 text_channel_id=int(data["channelId"]),
                 author_id=int(data["authorId"]),
                 raw=str(data.get("raw", "")),
+                progress_message_id=str(data.get("progressMessageId") or "") or None,
             )
         )
 
@@ -84,6 +88,42 @@ def create_api(manager: StreamManager, secret: str):
                 guild_id=int(data["guildId"]), author_id=int(data["authorId"])
             )
         )
+
+    async def control_stream(request):
+        data = await body(request)
+        guild_id = int(data["guildId"])
+        author_id = int(data["authorId"])
+        command = str(data.get("command") or "").casefold()
+        value = data.get("value")
+        if command == "pause":
+            result = await manager.pause(guild_id=guild_id, author_id=author_id)
+        elif command == "resume":
+            result = await manager.resume(guild_id=guild_id, author_id=author_id)
+        elif command == "skip":
+            result = await manager.skip(guild_id=guild_id, author_id=author_id)
+        elif command == "stop":
+            result = await manager.stop(guild_id=guild_id, author_id=author_id)
+        elif command == "skipto":
+            result = await manager.skip_to(
+                guild_id=guild_id, author_id=author_id, episode=value
+            )
+        elif command in {"forward", "backward"}:
+            seconds = float(value)
+            delta = seconds if command == "forward" else -seconds
+            result = await manager.seek(
+                guild_id=guild_id, author_id=author_id, seconds=delta
+            )
+        elif command == "volume":
+            result = await manager.set_volume(
+                guild_id=guild_id, author_id=author_id, volume=value
+            )
+        elif command == "autopause":
+            result = await manager.set_autopause(
+                guild_id=guild_id, author_id=author_id, enabled=value
+            )
+        else:
+            raise StreamRequestError("Unknown stream control command.")
+        return json_response(result)
 
     async def stream_status(request):
         data = await body(request)
@@ -104,6 +144,7 @@ def create_api(manager: StreamManager, secret: str):
     app.router.add_post("/stream/start", start_stream)
     app.router.add_post("/stream/skip", skip_stream)
     app.router.add_post("/stream/stop", stop_stream)
+    app.router.add_post("/stream/control", control_stream)
     app.router.add_post("/stream/status", stream_status)
     app.router.add_post("/internal/segment-event", segment_event)
     app.router.add_post("/internal/progress", progress_event)

@@ -82,6 +82,8 @@ class StreamBridge:
         bitrate: int,
         threads: int,
         preset: str,
+        volume: int = 50,
+        autopause: bool = False,
     ):
         return await self._request(
             "/api/series/start",
@@ -92,6 +94,8 @@ class StreamBridge:
                 "bitrate": int(bitrate),
                 "threads": int(threads),
                 "preset": preset,
+                "volume": int(volume),
+                "autopause": bool(autopause),
             },
             timeout=60,
         )
@@ -118,6 +122,33 @@ class StreamBridge:
     async def series_skip(self, series_id: str, episode: int):
         return await self._request(
             "/api/series/skip", {"seriesId": series_id, "episode": episode}
+        )
+
+    async def series_pause(self, series_id: str):
+        return await self._request("/api/series/pause", {"seriesId": series_id})
+
+    async def series_resume(self, series_id: str):
+        return await self._request("/api/series/resume", {"seriesId": series_id})
+
+    async def series_seek(self, series_id: str, seconds: float):
+        return await self._request(
+            "/api/series/seek", {"seriesId": series_id, "seconds": float(seconds)}
+        )
+
+    async def series_skip_to(self, series_id: str, episode: int):
+        return await self._request(
+            "/api/series/skipto", {"seriesId": series_id, "episode": int(episode)}
+        )
+
+    async def series_volume(self, series_id: str, volume: int):
+        return await self._request(
+            "/api/series/volume", {"seriesId": series_id, "volume": int(volume)}
+        )
+
+    async def series_autopause(self, series_id: str, enabled: bool):
+        return await self._request(
+            "/api/series/autopause",
+            {"seriesId": series_id, "enabled": bool(enabled)},
         )
 
     async def series_end(self, series_id: str):

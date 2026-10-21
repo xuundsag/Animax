@@ -1,4 +1,4 @@
-"""Lazily start and supervise the Go Live sidecar for the additive .stream command."""
+"""Lazily start and supervise the separate ? command listener and Go Live sidecar."""
 
 from __future__ import annotations
 
@@ -138,7 +138,7 @@ def _ensure_stream_dependencies(root: Path):
     node = shutil.which("node")
     if not node:
         raise RuntimeError(
-            ".stream requires Node.js 22.4.0 or newer; install Node.js and retry."
+            "The ? Go Live listener requires Node.js 22.4.0 or newer; install Node.js and retry."
         )
     result = subprocess.run(
         [node, "--version"], capture_output=True, text=True, timeout=10
@@ -146,7 +146,9 @@ def _ensure_stream_dependencies(root: Path):
     version = _version_tuple(result.stdout or result.stderr)
     if result.returncode or not version or version < NODE_MINIMUM:
         found = (result.stdout or result.stderr).strip() or "unknown"
-        raise RuntimeError(f".stream requires Node.js 22.4.0 or newer; found {found}.")
+        raise RuntimeError(
+            f"The ? Go Live listener requires Node.js 22.4.0 or newer; found {found}."
+        )
 
     filters = subprocess.run(
         ["ffmpeg", "-hide_banner", "-filters"],
@@ -179,7 +181,7 @@ def _ensure_stream_dependencies(root: Path):
         or "mpegts" not in formats.stdout
     ):
         raise RuntimeError(
-            ".stream requires CPU FFmpeg with libx264, AAC, drawtext, and MPEG-TS support."
+            "Go Live requires CPU FFmpeg with libx264, AAC, drawtext, and MPEG-TS support."
         )
     print(
         f"[{time.strftime('%H:%M:%S')}] ANIMAX STREAM | FFmpeg preflight passed.",
@@ -192,10 +194,10 @@ def _ensure_stream_dependencies(root: Path):
     npm = shutil.which("npm")
     if not lock.exists() or not npm:
         raise RuntimeError(
-            ".stream dependencies are missing; restore package-lock.json and npm, then retry."
+            "Go Live dependencies are missing; restore package-lock.json and npm, then retry."
         )
     print(
-        f"[{time.strftime('%H:%M:%S')}] ANIMAX | Installing Go Live dependencies for .stream...",
+        f"[{time.strftime('%H:%M:%S')}] ANIMAX | Installing Go Live dependencies for the ? listener...",
         flush=True,
     )
     returncode = _run_timestamped(
@@ -205,7 +207,7 @@ def _ensure_stream_dependencies(root: Path):
     )
     if returncode or not _package_versions_match(root):
         raise RuntimeError(
-            "Could not install the pinned .stream dependencies; see npm output above."
+            "Could not install the pinned Go Live dependencies; see npm output above."
         )
 
 
@@ -260,6 +262,8 @@ class StreamRuntime:
         command_user_id: str | None = None,
         library=None,
         attachment_lookup=None,
+        voice_lookup=None,
+        stream_guard=None,
         ui=None,
     ):
         self.token = token
@@ -275,6 +279,8 @@ class StreamRuntime:
             self.root,
             library=library,
             attachment_lookup=attachment_lookup,
+            voice_lookup=voice_lookup,
+            stream_guard=stream_guard,
             ui=ui,
             command_account_id=self.command_user_id,
         )
@@ -379,7 +385,7 @@ class StreamRuntime:
                 health = await self.bridge.health()
                 _validate_stream_health(health, self.command_user_id)
                 self.started = True
-                log.info(".stream Go Live sidecar is ready.")
+                log.info("? command listener and Go Live sidecar are ready.")
                 self._event(
                     f"Go Live sidecar ready as distinct user {health.get('userId')}; main DISCORD_TOKEN was not passed to Node.",
                     "green",
