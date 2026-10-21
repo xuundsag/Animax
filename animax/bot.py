@@ -71,6 +71,7 @@ class MegaPlayBot(commands.Bot):
         )
         self.cfg, self.library, self.ui = settings, library, ui or Terminal(quiet=True)
         self.token = token or os.getenv("DISCORD_TOKEN", "").strip()
+        self.stream_token = os.getenv("STREAM_DISCORD_TOKEN", "").strip()
         self.stream_runtime = None
         self.stream_manager = None
         self.stream_starting = False
@@ -106,12 +107,19 @@ class MegaPlayBot(commands.Bot):
         )
 
     async def ensure_stream_runtime(self):
-        if not self.token:
+        if not self.stream_token or self.stream_token.startswith("YOUR_"):
             raise RuntimeError(
-                "DISCORD_TOKEN is unavailable to start the .stream sidecar."
+                "Set STREAM_DISCORD_TOKEN in .env to a separate streaming user account before using `.stream`."
+            )
+        if self.stream_token == self.token:
+            raise RuntimeError(
+                "STREAM_DISCORD_TOKEN must be a different account token from DISCORD_TOKEN."
             )
         if self.stream_runtime is None:
-            self.stream_runtime = StreamRuntime(self.token, self.cfg, ROOT)
+            command_user_id = str(self.user.id) if self.user else None
+            self.stream_runtime = StreamRuntime(
+                self.stream_token, self.cfg, ROOT, command_user_id=command_user_id
+            )
         self.stream_manager = await self.stream_runtime.start()
         return self.stream_manager
 
@@ -123,10 +131,7 @@ class MegaPlayBot(commands.Bot):
             await ctx.cleanup_trigger()
 
     async def on_ready(self):
-        self.ui.event(
-            f"Connected as {self.user}. Commands: .download · .stream · .status · .help",
-            "bold green",
-        )
+        self.ui.event(f"Connected as {self.user}", "bold green")
         if not self.startup_done:
             self.startup_done = True
             self.scheduler.configure()
@@ -1260,13 +1265,12 @@ def main():
     load_dotenv(ROOT / ".env")
     setup_logging(ROOT)
     ui = Terminal()
-    ui.banner()
     try:
         dependency_report()
         token = os.getenv("DISCORD_TOKEN", "").strip()
-        if not token or token == "YOUR_USER_TOKEN_HERE":
+        if not token or token.startswith("YOUR_"):
             raise ValueError(
-                "Set DISCORD_TOKEN locally in .env before starting. Do not share it."
+                "Set the main user's DISCORD_TOKEN locally in .env before starting. Do not share it."
             )
         cfg = Settings.from_env(ROOT / "settings.json")
         with InstanceLock(ROOT / ".animax.lock"):

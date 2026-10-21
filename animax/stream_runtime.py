@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from aiohttp import web
@@ -41,6 +42,51 @@ def _package_versions_match(root: Path):
         if version != expected:
             return False
     return True
+
+
+def _validate_stream_health(health: dict, command_user_id: str | None = None):
+    if not health.get("discordReady"):
+        raise RuntimeError("The separate streaming Discord account is not ready.")
+    stream_user_id = str(health.get("userId") or "")
+    if not stream_user_id:
+        raise RuntimeError("The streaming sidecar did not report its Discord user ID.")
+    if command_user_id and stream_user_id == str(command_user_id):
+        raise RuntimeError(
+            "STREAM_DISCORD_TOKEN logged into the main command account; configure a different streaming user account."
+        )
+
+
+def _sidecar_environment(
+    stream_token: str,
+    root: Path,
+    secret: str,
+    api_port: int,
+    inherited: dict[str, str] | None = None,
+):
+    environment = (os.environ if inherited is None else inherited).copy()
+    environment.pop("DISCORD_TOKEN", None)
+    environment.update(
+        {
+            "STREAM_DISCORD_TOKEN": stream_token,
+            "ANIMAX_ROOT": str(root),
+            "ANIMAX_API_KEY": secret,
+            "ANIMAX_PYTHON_API": f"http://127.0.0.1:{api_port}",
+        }
+    )
+    return environment
+
+
+def _run_timestamped(command, *, cwd: Path, timeout: int):
+    result = subprocess.run(
+        command,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    for line in (result.stdout + result.stderr).splitlines():
+        print(f"[{time.strftime('%H:%M:%S')}] {line}", flush=True)
+    return result.returncode
 
 
 def _ensure_stream_dependencies(root: Path):
@@ -88,13 +134,16 @@ def _ensure_stream_dependencies(root: Path):
         raise RuntimeError(
             ".stream dependencies are missing; restore package-lock.json and npm, then retry."
         )
-    print("ANIMAX | Installing Go Live dependencies for .stream...", flush=True)
-    result = subprocess.run(
+    print(
+        f"[{time.strftime('%H:%M:%S')}] ANIMAX | Installing Go Live dependencies for .stream...",
+        flush=True,
+    )
+    returncode = _run_timestamped(
         [npm, "ci", "--omit=dev", "--no-audit", "--no-fund"],
         cwd=root,
         timeout=900,
     )
-    if result.returncode or not _package_versions_match(root):
+    if returncode or not _package_versions_match(root):
         raise RuntimeError(
             "Could not install the pinned .stream dependencies; see npm output above."
         )
@@ -131,8 +180,11 @@ async def _read_node_stdout(process, ready: asyncio.Event, port_future):
 class StreamRuntime:
     """Own the local Python API and single Node Go Live session, started on first use."""
 
-    def __init__(self, token: str, settings, root: Path):
+    def __init__(
+        self, token: str, settings, root: Path, *, command_user_id: str | None = None
+    ):
         self.token = token
+        self.command_user_id = str(command_user_id) if command_user_id else None
         self.settings = settings
         self.root = Path(root)
         self.secret = os.urandom(32).hex()
@@ -163,14 +215,8 @@ class StreamRuntime:
             log_path = logs / "stream-bridge.log"
             self.node_log = log_path.open("a", encoding="utf-8")
             log_path.chmod(0o600)
-            environment = os.environ.copy()
-            environment.update(
-                {
-                    "DISCORD_TOKEN": self.token,
-                    "ANIMAX_ROOT": str(self.root),
-                    "ANIMAX_API_KEY": self.secret,
-                    "ANIMAX_PYTHON_API": f"http://127.0.0.1:{api_port}",
-                }
+            environment = _sidecar_environment(
+                self.token, self.root, self.secret, api_port
             )
             node = shutil.which("node")
             try:
@@ -220,7 +266,8 @@ class StreamRuntime:
                         "Go Live sidecar did not publish its local API port."
                     )
                 self.bridge.base_url = f"http://127.0.0.1:{port_future.result()}"
-                await self.bridge.health()
+                health = await self.bridge.health()
+                _validate_stream_health(health, self.command_user_id)
                 self.started = True
                 log.info(".stream Go Live sidecar is ready.")
                 return self.manager

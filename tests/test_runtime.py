@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -8,8 +9,12 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from animax.settings import FIELDS, Settings
 from animax.stream_api import create_api
-from animax.stream_runtime import _version_tuple
-from animax.streaming import StreamManager
+from animax.stream_runtime import (
+    _sidecar_environment,
+    _validate_stream_health,
+    _version_tuple,
+)
+from animax.streaming import StreamManager, StreamSession, parse_stream_request
 
 
 class NullBridge:
@@ -22,6 +27,35 @@ def test_node_runtime_version_parser():
     assert _version_tuple("v24.1.2") > (22, 4, 0)
     assert _version_tuple("v20.20.2") < (22, 4, 0)
     assert _version_tuple("unknown") is None
+
+
+def test_stream_health_requires_ready_distinct_user_id():
+    _validate_stream_health(
+        {"discordReady": True, "userId": "stream-user"}, "main-user"
+    )
+    with pytest.raises(RuntimeError, match="not ready"):
+        _validate_stream_health(
+            {"discordReady": False, "userId": "stream-user"}, "main-user"
+        )
+    with pytest.raises(RuntimeError, match="user ID"):
+        _validate_stream_health({"discordReady": True}, "main-user")
+    with pytest.raises(RuntimeError, match="different streaming user"):
+        _validate_stream_health(
+            {"discordReady": True, "userId": "main-user"}, "main-user"
+        )
+
+
+def test_sidecar_receives_only_the_separate_streaming_token(tmp_path):
+    environment = _sidecar_environment(
+        "stream-token",
+        tmp_path,
+        "local-secret",
+        12345,
+        {"DISCORD_TOKEN": "main-token", "OTHER": "kept"},
+    )
+    assert "DISCORD_TOKEN" not in environment
+    assert environment["STREAM_DISCORD_TOKEN"] == "stream-token"
+    assert environment["OTHER"] == "kept"
 
 
 def test_legacy_worker_settings_are_ignored_but_download_settings_remain(tmp_path):
@@ -56,6 +90,52 @@ def test_package_pins_current_dave_compatible_sidecar():
     lock = json.loads((root / "package-lock.json").read_text())
     locked = lock["packages"]["node_modules/@dank074/discord-video-stream"]
     assert locked["version"] == "7.0.0"
+    sidecar = (
+        Path(__file__).resolve().parents[1] / "animax" / "stream_bridge.mjs"
+    ).read_text()
+    assert "process.env.STREAM_DISCORD_TOKEN" in sidecar
+    assert "client.login(streamToken)" in sidecar
+    assert "process.env.DISCORD_TOKEN" not in sidecar
+
+
+@pytest.mark.asyncio
+async def test_internal_progress_route_updates_current_episode(tmp_path):
+    secret = "local-test-secret"
+    manager = StreamManager(Settings(), NullBridge(), tmp_path)
+    session = StreamSession(
+        "series",
+        1,
+        2,
+        3,
+        4,
+        parse_stream_request("One Piece 1 2"),
+        title="One Piece",
+        current_episode=1,
+    )
+    session.task = asyncio.create_task(asyncio.sleep(30))
+    manager.session = session
+    client = TestClient(TestServer(create_api(manager, secret)))
+    await client.start_server()
+    try:
+        response = await client.post(
+            "/internal/progress",
+            json={
+                "seriesId": "series",
+                "episode": 1,
+                "kind": "episode",
+                "elapsed": 10,
+                "duration": 1440,
+            },
+            headers={"Authorization": f"Bearer {secret}"},
+        )
+        assert response.status == 200
+        assert session.playback_state == "Streaming"
+        assert session.playback_duration == 1440
+        assert session.playback_elapsed == 10
+    finally:
+        session.task.cancel()
+        await asyncio.gather(session.task, return_exceptions=True)
+        await client.close()
 
 
 @pytest.mark.asyncio

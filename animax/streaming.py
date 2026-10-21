@@ -5,15 +5,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import shlex
 import shutil
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .bridge import BridgeError, StreamBridge
 from .encoding import FONT_FILES
-from .metadata import TitleError, resolve_anime
+from .metadata import TitleError, provisional_title, resolve_anime
 from .resolver import (
     CaptionUnavailable,
     Resolver,
@@ -27,6 +29,7 @@ from .titlecard import create_title_card
 log = logging.getLogger("animax.streaming")
 ROOT = Path(__file__).resolve().parent.parent
 SKIPPED = object()
+STREAM_ENCODER_PRESET = "ultrafast"
 
 
 class StreamRequestError(ValueError):
@@ -113,6 +116,7 @@ class StreamSession:
     current_episode: int | None = None
     preparing_episode: int | None = None
     prefetch_episode: int | None = None
+    prefetch_started_at: float | None = None
     task: asyncio.Task | None = None
     prepare_task: asyncio.Task | None = None
     prefetch_task: asyncio.Task | None = None
@@ -127,6 +131,15 @@ class StreamSession:
     caption_notice_sent: bool = False
     skip_notice_sent: bool = False
     card_directory: Path | None = None
+    playback_episode: int | None = None
+    playback_state: str = "Preparing"
+    playback_elapsed: float = 0.0
+    playback_duration: float = 0.0
+    playback_updated_at: float | None = None
+    status_started_at: float | None = None
+    progress_message_id: str | None = None
+    progress_message_text: str = ""
+    progress_task: asyncio.Task | None = None
 
 
 class StreamManager:
@@ -141,10 +154,48 @@ class StreamManager:
 
     async def _send(self, session: StreamSession, text: str):
         try:
-            await self.bridge.send(session.text_channel_id, text)
+            return await self.bridge.send(session.text_channel_id, text)
         except BridgeError:
             log.warning(
                 "Could not send stream status to channel %s", session.text_channel_id
+            )
+            return None
+
+    async def _update_progress_message(self, session: StreamSession):
+        content = self._progress_text(session)
+        if content == session.progress_message_text:
+            return
+        try:
+            if session.progress_message_id:
+                await self.bridge.edit(
+                    session.text_channel_id, session.progress_message_id, content
+                )
+            else:
+                result = await self.bridge.send(session.text_channel_id, content)
+                message_id = (
+                    result.get("messageId") if isinstance(result, dict) else None
+                )
+                if message_id:
+                    session.progress_message_id = str(message_id)
+            session.progress_message_text = content
+        except BridgeError:
+            log.warning(
+                "Could not update stream progress in channel %s",
+                session.text_channel_id,
+                exc_info=True,
+            )
+
+    async def _progress_reporter(self, session: StreamSession):
+        while True:
+            await self._update_progress_message(session)
+            await asyncio.sleep(5)
+
+    async def _start_progress_reporter(self, session: StreamSession):
+        await self._update_progress_message(session)
+        if session.progress_task is None or session.progress_task.done():
+            session.progress_task = asyncio.create_task(
+                self._progress_reporter(session),
+                name=f"animax-stream-progress-{session.id[:8]}",
             )
 
     async def start(
@@ -185,29 +236,70 @@ class StreamManager:
             ),
         }
 
+    @staticmethod
+    def _clock(seconds: float) -> str:
+        value = max(0, int(seconds))
+        return f"{value // 60}:{value % 60:02d}"
+
+    def _progress_text(self, session: StreamSession) -> str:
+        episode = (
+            session.current_episode
+            or session.preparing_episode
+            or session.prefetch_episode
+            or session.playback_episode
+            or session.request.start
+        )
+        duration = max(0.0, float(session.playback_duration or 0))
+        elapsed = max(0.0, float(session.playback_elapsed or 0))
+        if session.playback_state == "Streaming" and session.playback_updated_at:
+            elapsed += max(0.0, time.monotonic() - session.playback_updated_at)
+        if session.playback_state in {"Finding title", "Connecting", "Preparing"}:
+            stage_elapsed = (
+                max(0.0, time.monotonic() - session.status_started_at)
+                if session.status_started_at
+                else 0.0
+            )
+            timing = f"{self._clock(stage_elapsed)} elapsed"
+        elif duration > 0:
+            elapsed = min(duration, elapsed)
+            timing = (
+                f"{self._clock(elapsed)} / {self._clock(duration)} "
+                f"({min(100, int(elapsed * 100 / duration))}%)"
+            )
+        else:
+            timing = "0:00 / --:-- (0%)"
+        content = (
+            f"**{session.title or session.request.query}** | `E{episode}` | "
+            f"{session.playback_state} | {timing}"
+        )
+        if (
+            session.playback_state == "Connecting"
+            and session.preparing_episode
+            and session.prepare_task
+            and not session.prepare_task.done()
+        ):
+            content += f"\nPreparing E{session.preparing_episode} in parallel"
+        return content
+
     def status(self, guild_id: int | None = None):
         session = self.session
         if not session or not session.task or session.task.done():
             return {"ok": True, "message": "No active Go Live stream."}
         if guild_id is not None and int(guild_id) != session.guild_id:
             return {"ok": True, "message": "No active Go Live stream in this server."}
-        active = (
-            f"E{session.current_episode}" if session.current_episode else "preparing"
-        )
-        prefetch = (
-            f"; next slot: E{session.prefetch_episode}"
-            if session.prefetch_episode
-            else ""
-        )
+        message = self._progress_text(session)
+        if (
+            session.prefetch_episode
+            and session.current_episode
+            and session.prefetch_task
+            and not session.prefetch_task.done()
+        ):
+            message += f"\nPreparing E{session.prefetch_episode}"
         return {
             "ok": True,
-            "message": (
-                f"**{session.title or session.request.query}** — {active}; "
-                f"range E{session.request.start}–E{session.request.end}; "
-                f"{session.phase}{prefetch}."
-            ),
+            "message": message,
             "phase": session.phase,
-            "episode": session.current_episode,
+            "episode": session.current_episode or session.preparing_episode,
             "prefetchEpisode": session.prefetch_episode,
         }
 
@@ -267,6 +359,41 @@ class StreamManager:
             "error": str(body.get("error") or ""),
         }
         session.episode_events.setdefault(episode, asyncio.Event()).set()
+        if episode == session.current_episode:
+            session.playback_updated_at = None
+            if session.episode_results[episode]["error"]:
+                session.playback_state = "Failed"
+            elif session.episode_results[episode]["skipped"]:
+                session.playback_state = "Skipped"
+            else:
+                session.playback_elapsed = session.playback_duration
+                session.playback_state = "Finished"
+
+    async def handle_progress_event(self, body: dict):
+        session = self.session
+        if not session or str(body.get("seriesId")) != session.id:
+            return
+        if body.get("kind") != "episode":
+            return
+        try:
+            episode = int(body.get("episode"))
+            elapsed = float(body.get("elapsed"))
+            duration = float(body.get("duration"))
+        except (TypeError, ValueError):
+            return
+        if (
+            episode != session.current_episode
+            or not math.isfinite(elapsed)
+            or not math.isfinite(duration)
+            or elapsed < 0
+            or duration <= 0
+        ):
+            return
+        session.playback_episode = episode
+        session.playback_duration = duration
+        session.playback_elapsed = min(elapsed, duration)
+        session.playback_updated_at = time.monotonic()
+        session.playback_state = "Streaming"
 
     async def handle_series_event(self, body: dict):
         session = self.session
@@ -310,6 +437,7 @@ class StreamManager:
                 session.prepare_task = None
             if session.prefetch_task is task:
                 session.prefetch_task = None
+                session.prefetch_started_at = None
             if session.preparing_episode == episode:
                 session.preparing_episode = None
             if session.prefetch_episode == episode:
@@ -343,31 +471,105 @@ class StreamManager:
         current_episode = session.request.start
         try:
             session.phase = "Finding the best title match"
+            session.playback_episode = session.request.start
+            session.playback_state = "Finding title"
+            session.status_started_at = time.monotonic()
+            await self._start_progress_reporter(session)
             mal_id, title, score = await resolve_anime(
                 session.request.query, self.root / "title_overrides.json"
             )
+            if session.stop_event.is_set():
+                terminal = "stopped"
+                return
             session.mal_id, session.title = mal_id, title
-            await self._send(
-                session,
-                f"Matched **{title}** (MAL {mal_id}, match {score}%). Connecting to your current voice channel…",
-            )
-            await self.bridge.join(session.guild_id, session.voice_channel_id)
+            session.phase = "Connecting to the voice channel"
+            session.playback_state = "Connecting"
+            session.status_started_at = time.monotonic()
+            await self._update_progress_message(session)
+            if provisional_title(title, mal_id):
+                title_message = (
+                    f"Title lookup is unavailable; continuing with MAL ID {mal_id} "
+                    f"and placeholder title `{title}`. Connecting the streaming account to voice…"
+                )
+            else:
+                title_message = (
+                    f"Matched **{title}** (MAL {mal_id}, match {score}%). "
+                    "Connecting the streaming account to your current voice channel…"
+                )
+            await self._send(session, title_message)
             session.card_directory = (
                 self.root / "downloads" / ".animax_cards" / session.id
             )
             episode = session.request.start
+            session.phase = f"Preparing E{episode} and connecting voice"
+            session.playback_episode = episode
+            session.playback_state = "Connecting"
+            session.playback_duration = 0.0
+            session.playback_elapsed = 0.0
+            session.playback_updated_at = None
+            session.status_started_at = time.monotonic()
+            session.preparing_episode = episode
+            await self._update_progress_message(session)
+            first_task = asyncio.create_task(
+                self._prepare_episode(session, episode),
+                name=f"animax-first-episode-e{episode}",
+            )
+            session.prepare_task = first_task
+            await self.bridge.join(session.guild_id, session.voice_channel_id)
+            if not first_task.done() and not session.stop_event.is_set():
+                session.phase = f"Preparing E{episode}"
+                session.playback_state = "Preparing"
+                session.status_started_at = time.monotonic()
+                await self._update_progress_message(session)
+            prepared = await self._await_prepare(session, episode, first_task)
+            if prepared is SKIPPED:
+                session.playback_state = "Skipped"
+                session.status_started_at = None
+                await self._update_progress_message(session)
+                episode += 1
+                prepared = None
+            elif prepared is not None:
+                if session.stop_event.is_set():
+                    if not self.settings.keep_stream_cache:
+                        shutil.rmtree(prepared.work, ignore_errors=True)
+                    prepared = None
+                else:
+                    session.playback_duration = prepared.duration
+                    session.playback_elapsed = 0.0
+                    session.playback_state = "Starting"
+                    session.status_started_at = None
+                    await self._update_progress_message(session)
+
             while episode <= session.request.end and not session.stop_event.is_set():
                 if prepared is None:
                     session.phase = f"Preparing E{episode}"
-                    task = asyncio.create_task(self._prepare_episode(session, episode))
-                    session.prepare_task = task
+                    session.playback_episode = episode
+                    session.playback_state = "Preparing"
+                    session.playback_duration = 0.0
+                    session.playback_elapsed = 0.0
+                    session.playback_updated_at = None
+                    session.status_started_at = time.monotonic()
                     session.preparing_episode = episode
+                    await self._update_progress_message(session)
+                    task = asyncio.create_task(
+                        self._prepare_episode(session, episode),
+                        name=f"animax-prepare-e{episode}",
+                    )
+                    session.prepare_task = task
                     prepared = await self._await_prepare(session, episode, task)
                     if prepared is SKIPPED:
+                        session.playback_state = "Skipped"
+                        session.status_started_at = None
+                        await self._update_progress_message(session)
                         episode += 1
                         continue
                     if prepared is None or session.stop_event.is_set():
                         break
+                    session.playback_duration = prepared.duration
+                    session.playback_elapsed = 0.0
+                    session.playback_state = "Starting"
+                    session.status_started_at = None
+                    await self._update_progress_message(session)
                 current_episode = episode
                 card = await self._make_card(session, episode)
                 if session.stop_event.is_set():
@@ -379,10 +581,15 @@ class StreamManager:
                         session.voice_channel_id,
                         bitrate=self.settings.stream_bitrate_kbps,
                         threads=self.settings.encode_threads,
-                        preset=self.settings.encoder_preset,
+                        preset=STREAM_ENCODER_PRESET,
                     )
                     session.series_started = True
                 session.current_episode = episode
+                session.playback_episode = episode
+                session.playback_state = "Starting"
+                session.playback_elapsed = 0.0
+                session.playback_duration = prepared.duration
+                session.playback_updated_at = None
                 session.episode_events[episode] = asyncio.Event()
                 session.episode_results.pop(episode, None)
                 await self.bridge.series_add(
@@ -399,10 +606,7 @@ class StreamManager:
                     str(prepared.path.resolve()),
                     prepared.duration,
                 )
-                await self._send(
-                    session,
-                    f"Starting Episode {episode} — {title}. Go Live is active in your current voice channel.",
-                )
+                await self._start_progress_reporter(session)
 
                 next_task = None
                 next_episode = episode + 1
@@ -414,6 +618,7 @@ class StreamManager:
                     next_task.add_done_callback(self._consume_task_exception)
                     session.prefetch_task = next_task
                     session.prefetch_episode = next_episode
+                    session.prefetch_started_at = time.monotonic()
                     if session.stop_event.is_set():
                         break
                     session.phase = f"Streaming E{episode}; preparing E{next_episode}"
@@ -421,10 +626,7 @@ class StreamManager:
                 result = await self._wait_episode(session, episode)
                 if result.get("stopped") or session.stop_event.is_set():
                     break
-                if result.get("skipped"):
-                    await self._send(session, f"Skipped Episode {episode}.")
-                else:
-                    await self._send(session, f"Finished Episode {episode}.")
+                await self._update_progress_message(session)
                 session.current_episode = None
                 if not self.settings.keep_stream_cache:
                     shutil.rmtree(prepared.work, ignore_errors=True)
@@ -432,10 +634,24 @@ class StreamManager:
 
                 if next_task:
                     session.phase = f"Waiting for E{next_episode} to finish preparing"
+                    if not next_task.done():
+                        session.playback_episode = next_episode
+                        session.playback_state = "Preparing"
+                        session.playback_duration = 0.0
+                        session.playback_elapsed = 0.0
+                        session.playback_updated_at = None
+                        session.status_started_at = (
+                            session.prefetch_started_at or time.monotonic()
+                        )
+                        await self._update_progress_message(session)
                     next_prepared = await self._await_prepare(
                         session, next_episode, next_task
                     )
                     if next_prepared is SKIPPED:
+                        session.playback_episode = next_episode
+                        session.playback_state = "Skipped"
+                        session.status_started_at = None
+                        await self._update_progress_message(session)
                         episode = next_episode + 1
                         continue
                     if next_prepared is None:
@@ -446,6 +662,13 @@ class StreamManager:
                         break
                     prepared = next_prepared
                     episode = next_episode
+                    session.playback_episode = next_episode
+                    session.playback_state = "Starting"
+                    session.playback_duration = prepared.duration
+                    session.playback_elapsed = 0.0
+                    session.playback_updated_at = None
+                    session.status_started_at = None
+                    await self._update_progress_message(session)
                 else:
                     episode += 1
 
@@ -507,6 +730,10 @@ class StreamManager:
                     error_text = session.node_error[:1000]
             with contextlib.suppress(BridgeError):
                 await self.bridge.leave(session.guild_id)
+            if session.progress_task and not session.progress_task.done():
+                session.progress_task.cancel()
+                await asyncio.gather(session.progress_task, return_exceptions=True)
+            session.progress_task = None
             if session.card_directory:
                 shutil.rmtree(session.card_directory, ignore_errors=True)
             session.current_episode = None
@@ -517,6 +744,10 @@ class StreamManager:
                 "stopped": "Stopped",
                 "failed": "Failed",
             }[terminal]
+            session.playback_state = session.phase
+            session.playback_updated_at = None
+            if session.progress_message_text:
+                await self._update_progress_message(session)
             if terminal == "failed":
                 await self._send(
                     session,
@@ -582,7 +813,7 @@ class StreamManager:
             session.request.language,
             1080,
             "burn",
-            encoder_preset=cfg.encoder_preset,
+            encoder_preset=STREAM_ENCODER_PRESET,
             target_mb=cfg.target_mb,
             video_crf=cfg.video_crf,
             compression_mode=cfg.compression_mode,
@@ -646,7 +877,7 @@ class StreamManager:
                     max_bytes=cfg.max_temp_bytes,
                     timeout=cfg.operation_timeout,
                     request_interval=cfg.request_interval,
-                    encoder_preset=cfg.encoder_preset,
+                    encoder_preset=STREAM_ENCODER_PRESET,
                     encode_threads=cfg.encode_threads,
                     target_mb=cfg.target_mb,
                     video_crf=cfg.video_crf,

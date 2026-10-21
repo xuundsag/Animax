@@ -56,6 +56,16 @@ class StreamBridge:
             "/api/send", {"channelId": str(channel_id), "content": content[:1900]}
         )
 
+    async def edit(self, channel_id: int, message_id: str, content: str):
+        return await self._request(
+            "/api/edit",
+            {
+                "channelId": str(channel_id),
+                "messageId": str(message_id),
+                "content": content[:1900],
+            },
+        )
+
     async def join(self, guild_id: int, voice_id: int):
         return await self._request(
             "/api/join",

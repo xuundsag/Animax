@@ -93,6 +93,10 @@ def create_api(manager: StreamManager, secret: str):
         await manager.handle_segment_event(await body(request))
         return json_response({"ok": True})
 
+    async def progress_event(request):
+        await manager.handle_progress_event(await body(request))
+        return json_response({"ok": True})
+
     async def series_event(request):
         await manager.handle_series_event(await body(request))
         return json_response({"ok": True})
@@ -102,6 +106,7 @@ def create_api(manager: StreamManager, secret: str):
     app.router.add_post("/stream/stop", stop_stream)
     app.router.add_post("/stream/status", stream_status)
     app.router.add_post("/internal/segment-event", segment_event)
+    app.router.add_post("/internal/progress", progress_event)
     app.router.add_post("/internal/series-event", series_event)
     app.router.add_get("/health", health)
     return app

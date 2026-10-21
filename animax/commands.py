@@ -14,9 +14,8 @@ from .streaming import StreamBusy, StreamRequestError, parse_stream_request
 log = logging.getLogger("animax.commands")
 
 COMMAND_HELP = {
-    "capacity": "`.capacity`: estimate local CPU/RAM/disk headroom. Download jobs run one at a time; estimates are not a provider or Discord guarantee.",
     "download": "`.download MAL_ID dub|sub START END [resume|force] [#channel]`: inclusive range, one whole MP4 each. First use in a server requires the destination channel mention last, e.g. `.download 21 dub 1 10 #one-piece`. Later downloads reuse anime.json and ignore a supplied channel. Force can duplicate confirmed uploads; pending sends are still checked before retry.",
-    "stream": "`.stream <MAL ID or anime name> <start> <end> [Yes|No] [sub|dub]`: start a continuous Go Live series in your current voice channel. Fuzzy title matching; OP/ED skip is optional. Requires Node.js 22.4+ when first used.",
+    "stream": "`.stream <MAL ID or anime name> <start> <end> [Yes|No] [sub|dub]`: start Go Live in your current voice channel. The separate account in STREAM_DISCORD_TOKEN plays the video. Fuzzy title matching; OP/ED skip is optional. Requires Node.js 22.4+ when first used.",
     "skip": "`.skip`: skip the current Go Live episode, or cancel the episode being prepared if playback has not started.",
     "stop": "`.stop`: stop the Go Live series and leave voice. Only the person who started it can control it.",
     "status": "`.status`: show the serialized download queue and any active Go Live stream.",
@@ -124,7 +123,7 @@ def register_commands(bot):
         except StreamBusy as exc:
             await ctx.send(str(exc))
             return
-        except (OSError, RuntimeError) as exc:
+        except Exception as exc:
             await ctx.send(f".stream could not start: {str(exc)[:1000]}")
             log.warning(".stream startup failed", exc_info=True)
             return
@@ -252,14 +251,6 @@ def register_commands(bot):
             )
         for record in records:
             await bot.resume_record(record, ctx)
-
-    @bot.command(name="capacity", ignore_extra=False)
-    async def capacity_entry(ctx):
-        from .capacity import report_text
-
-        await ctx.send(
-            "```\n" + report_text(bot.library.path.parent, bot.cfg) + "\n```"
-        )
 
     @bot.command(name="reset", ignore_extra=False)
     async def reset_entry(ctx, action: str = "", token: str = ""):

@@ -13,6 +13,7 @@ from animax.streaming import (
     PreparedEpisode,
     StreamManager,
     StreamRequestError,
+    StreamSession,
     parse_stream_request,
 )
 
@@ -51,6 +52,44 @@ def test_title_search_selects_the_highest_fuzzy_match():
     assert score > 70
 
 
+@pytest.mark.asyncio
+async def test_stream_status_shows_download_style_episode_progress(tmp_path):
+    bridge = FakeBridge()
+    manager = StreamManager(Settings(), bridge, tmp_path)
+    session = StreamSession(
+        "series",
+        1,
+        2,
+        3,
+        4,
+        parse_stream_request("One Piece 1 2"),
+        title="One Piece",
+        current_episode=1,
+    )
+    session.task = asyncio.create_task(asyncio.sleep(30))
+    session.playback_duration = 1440
+    session.playback_state = "Starting"
+    manager.session = session
+    try:
+        await manager._update_progress_message(session)
+        await manager.handle_progress_event(
+            {
+                "seriesId": "series",
+                "episode": 1,
+                "kind": "episode",
+                "elapsed": 10,
+                "duration": 1440,
+            }
+        )
+        expected = "**One Piece** | `E1` | Streaming | 0:10 / 24:00 (0%)"
+        assert manager.status(1)["message"].startswith(expected)
+        await manager._update_progress_message(session)
+        assert bridge.edits[-1][2].startswith(expected)
+    finally:
+        session.task.cancel()
+        await asyncio.gather(session.task, return_exceptions=True)
+
+
 class FakeBridge:
     def __init__(self):
         self.manager = None
@@ -60,11 +99,16 @@ class FakeBridge:
         self.prefetch_events = {}
         self.skip_calls = []
         self.messages = []
+        self.edits = []
         self._completion_tasks = set()
 
     async def send(self, channel_id, content):
         self.messages.append((channel_id, content))
-        return {"ok": True}
+        return {"ok": True, "messageId": f"progress-{channel_id}"}
+
+    async def edit(self, channel_id, message_id, content):
+        self.edits.append((channel_id, message_id, content))
+        return {"ok": True, "messageId": message_id}
 
     async def join(self, guild_id, voice_id):
         return {"ok": True}
@@ -120,6 +164,14 @@ async def test_pipeline_prefetches_only_the_next_episode_during_playback(
     bridge = FakeBridge()
     manager = StreamManager(settings, bridge, tmp_path)
     bridge.manager = manager
+    join_finished_at = {}
+
+    async def delayed_join(_guild_id, _voice_id):
+        await asyncio.sleep(0.06)
+        join_finished_at["at"] = time.monotonic()
+        return {"ok": True}
+
+    monkeypatch.setattr(bridge, "join", delayed_join)
     starts = {}
     active_preparations = 0
     peak_preparations = 0
@@ -155,12 +207,20 @@ async def test_pipeline_prefetches_only_the_next_episode_during_playback(
     await asyncio.wait_for(session.task, timeout=5)
 
     assert [ep for ep, kind, _ in bridge.added if kind == "episode"] == [1, 2, 3]
+    assert starts[1] < join_finished_at["at"]
     assert starts[2] < bridge.completed_at[1]
     assert starts[3] > bridge.completed_at[1]
     assert starts[3] < bridge.completed_at[2]
     assert peak_preparations == 1
     assert bridge.started
-    assert any("Starting Episode 1" in message for _, message in bridge.messages)
+    assert bridge.started[0][1]["preset"] == "ultrafast"
+    assert any(
+        message.startswith("**One Piece** | `E1` |") for _, message in bridge.messages
+    )
+    assert any(
+        message.startswith("**One Piece** | `E3` | Finished | ")
+        for _, _, message in bridge.edits
+    )
 
 
 @pytest.mark.asyncio

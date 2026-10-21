@@ -112,14 +112,6 @@ class Terminal:
         self.tasks = {}
         self.last = {}
 
-    def banner(self):
-        self.console.print(
-            Text(
-                "ANIMAX 2.4.3  |  .help for commands  |  Ctrl+C saves progress",
-                style="bold cyan",
-            )
-        )
-
     def event(self, message, style="cyan"):
         self.console.print(
             Text(f"[{time.strftime('%H:%M:%S')}] {message}", style=style)
@@ -128,7 +120,10 @@ class Terminal:
     def start(self, title, key="default"):
         self.finish(key)
         self.progress.start()
-        self.tasks[key] = self.progress.add_task(title, total=100, label="Resolving")
+        timestamp = time.strftime("%H:%M:%S")
+        self.tasks[key] = self.progress.add_task(
+            f"[{timestamp}] {title}", total=100, label="Resolving"
+        )
 
     def update(self, job):
         fraction = job.progress.get("fraction")
@@ -156,9 +151,10 @@ class Terminal:
                     label += f" | {speed / 1024**2:.2f} MiB/s"
         task = self.tasks.get(job.id, self.tasks.get("default"))
         if task is not None:
+            timestamp = time.strftime("%H:%M:%S")
             self.progress.update(
                 task,
-                description=f"E{job.current} | {job.title[:32]}",
+                description=f"[{timestamp}] E{job.current} | {job.title[:32]}",
                 completed=percent or 0,
                 label=label,
             )

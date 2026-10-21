@@ -10,10 +10,9 @@ import { Encoders, playStream, prepareStream, Streamer, Utils } from '@dank074/d
 const root = resolve(process.env.ANIMAX_ROOT || process.cwd());
 const secret = process.env.ANIMAX_API_KEY || '';
 const pythonApi = (process.env.ANIMAX_PYTHON_API || '').replace(/\/$/, '');
-const token = process.env.DISCORD_TOKEN || '';
-const prefix = process.env.ANIMAX_PREFIX || '.';
+const streamToken = process.env.STREAM_DISCORD_TOKEN || '';
 
-if (!secret || !pythonApi || !token) throw new Error('Required sidecar environment is missing.');
+if (!secret || !pythonApi || !streamToken) throw new Error('Required streaming-account sidecar environment is missing.');
 
 const log = (message, error = undefined) => {
   const detail = error ? ` ${error?.stack || error}` : '';
@@ -176,16 +175,42 @@ class SeriesQueue {
         this.active = active;
         let skipped = false;
         let failure = '';
-        try {
-          for await (const chunk of remuxToTransportStream(item, this.offset, controller.signal)) {
-            if (this.aborted || this.signal.aborted) break;
-            yield chunk;
+        let progressPending = false;
+        const reportProgress = async () => {
+          if (item.kind !== 'episode' || this.active !== active || progressPending) return;
+          progressPending = true;
+          const duration = Math.max(0, Number(item.duration) || 0);
+          const elapsed = Math.min(duration || Infinity, Math.max(0, (performance.now() - active.started) / 1000));
+          try {
+            await postPython('/internal/progress', {
+              seriesId: this.seriesId,
+              episode: item.episode,
+              kind: item.kind,
+              elapsed,
+              duration,
+            });
+          } catch (error) {
+            log('Could not report Go Live playback progress.', error);
+          } finally {
+            progressPending = false;
           }
-          skipped = controller.signal.aborted && !this.signal.aborted && !this.aborted;
-        } catch (error) {
-          if (controller.signal.aborted && !this.signal.aborted && !this.aborted) skipped = true;
-          else if (this.signal.aborted || this.aborted) break;
-          else failure = String(error?.message || error);
+        };
+        const progressTimer = item.kind === 'episode' ? setInterval(() => { void reportProgress(); }, 2000) : null;
+        try {
+          try {
+            if (progressTimer) void reportProgress();
+            for await (const chunk of remuxToTransportStream(item, this.offset, controller.signal)) {
+              if (this.aborted || this.signal.aborted) break;
+              yield chunk;
+            }
+            skipped = controller.signal.aborted && !this.signal.aborted && !this.aborted;
+          } catch (error) {
+            if (controller.signal.aborted && !this.signal.aborted && !this.aborted) skipped = true;
+            else if (this.signal.aborted || this.aborted) break;
+            else failure = String(error?.message || error);
+          }
+        } finally {
+          if (progressTimer) clearInterval(progressTimer);
         }
         const elapsed = Math.max(0, (performance.now() - active.started) / 1000);
         this.offset += skipped ? Math.min(Number(item.duration) || elapsed, elapsed) : (Number(item.duration) || elapsed);
@@ -201,14 +226,43 @@ class SeriesQueue {
   }
 }
 
+const VOICE_JOIN_TIMEOUT_MS = 25000;
+
 async function joinVoice(guildId, voiceChannelId) {
-  if (!discordReady) throw new Error('Discord self-bot is not ready.');
+  if (!discordReady) throw new Error('Discord streaming account is not ready.');
   const guild = String(guildId);
   const channel = String(voiceChannelId);
-  if (joinedGuild === guild && joinedChannel === channel && streamer.voiceConnection) return;
-  await streamer.joinVoice(guild, channel);
-  joinedGuild = guild;
-  joinedChannel = channel;
+  if (
+    joinedGuild === guild &&
+    joinedChannel === channel &&
+    streamer.voiceConnection?.status?.started
+  ) return;
+
+  log(`Connecting streaming account ${client.user?.id || 'unknown'} to voice channel ${channel} in server ${guild}.`);
+  let timer;
+  try {
+    await Promise.race([
+      streamer.joinVoice(guild, channel),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(
+          `Voice connection did not become ready within ${VOICE_JOIN_TIMEOUT_MS / 1000}s. Check that the streaming account is in this server and has Connect permission; see logs/stream-bridge.log for voice/DAVE errors.`
+        )), VOICE_JOIN_TIMEOUT_MS);
+      }),
+    ]);
+    if (!streamer.voiceConnection?.status?.started) {
+      throw new Error('Discord voice connection did not reach the ready state.');
+    }
+    joinedGuild = guild;
+    joinedChannel = channel;
+    log(`Streaming account connected to voice channel ${channel} in server ${guild}.`);
+  } catch (error) {
+    try { streamer.leaveVoice(); } catch {}
+    joinedGuild = joinedChannel = null;
+    log(`Voice connection failed for channel ${channel}.`, error);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function startSeries(body) {
@@ -284,12 +338,29 @@ async function runSeries(state) {
 async function sendMessage(channelId, content) {
   const channel = client.channels.cache.get(String(channelId)) || await client.channels.fetch(String(channelId));
   if (!channel || typeof channel.send !== 'function') throw new Error('Text channel is unavailable.');
-  await channel.send(String(content || '').slice(0, 1900));
+  const message = await channel.send(String(content || '').slice(0, 1900));
+  return { messageId: String(message.id) };
+}
+
+async function editMessage(channelId, messageId, content) {
+  const channel = client.channels.cache.get(String(channelId)) || await client.channels.fetch(String(channelId));
+  if (!channel?.messages?.fetch) throw new Error('Text channel messages are unavailable.');
+  const message = await channel.messages.fetch(String(messageId));
+  if (!message || String(message.author?.id) !== String(client.user?.id)) {
+    throw new Error('Refused to edit a message not owned by the streaming account.');
+  }
+  await message.edit(String(content || '').slice(0, 1900));
+  return { messageId: String(message.id) };
 }
 
 async function handleApi(request, response) {
   if (['GET', 'POST'].includes(request.method) && request.url === '/api/health') {
-    return json(response, 200, { ok: true, discordReady, activeSeries: Boolean(activeSeries) });
+    return json(response, 200, {
+      ok: true,
+      discordReady,
+      userId: client.user?.id ? String(client.user.id) : null,
+      activeSeries: Boolean(activeSeries),
+    });
   }
   if (!authorized(request)) return json(response, 401, { ok: false, error: 'Unauthorized.' });
   let body;
@@ -297,9 +368,14 @@ async function handleApi(request, response) {
   catch (error) { return json(response, 400, { ok: false, error: error.message }); }
   try {
     switch (request.url) {
-      case '/api/send':
-        await sendMessage(body.channelId, body.content);
-        return json(response, 200, { ok: true });
+      case '/api/send': {
+        const result = await sendMessage(body.channelId, body.content);
+        return json(response, 200, { ok: true, ...result });
+      }
+      case '/api/edit': {
+        const result = await editMessage(body.channelId, body.messageId, body.content);
+        return json(response, 200, { ok: true, ...result });
+      }
       case '/api/join':
         await joinVoice(body.guildId, body.voiceChannelId);
         return json(response, 200, { ok: true });
@@ -361,15 +437,15 @@ const server = createServer((request, response) => {
 });
 server.listen(0, '127.0.0.1', () => {
   const port = server.address().port;
-  console.log(JSON.stringify({ event: 'http-ready', port }));
+  console.log(JSON.stringify({ event: 'http-ready', port, timestamp: new Date().toISOString() }));
 });
 
 client.once('ready', () => {
   discordReady = true;
-  console.log(JSON.stringify({ event: 'discord-ready', userId: client.user?.id }));
+  console.log(JSON.stringify({ event: 'discord-ready', userId: client.user?.id, timestamp: new Date().toISOString() }));
 });
 client.on('error', (error) => log('Discord client error.', error));
 process.on('unhandledRejection', (error) => log('Unhandled rejection.', error));
 process.on('uncaughtException', (error) => { log('Uncaught exception.', error); process.exitCode = 1; });
 
-await client.login(token);
+await client.login(streamToken);
