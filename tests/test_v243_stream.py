@@ -5,9 +5,11 @@ import time
 
 import pytest
 
+from animax.job import Job
 from animax.metadata import select_best_anime
 from animax.settings import Settings
 from animax.streaming import (
+    SKIPPED,
     PreparedEpisode,
     StreamManager,
     StreamRequestError,
@@ -206,3 +208,88 @@ async def test_skip_control_is_limited_to_original_command_author(tmp_path):
     finally:
         session.task.cancel()
         await asyncio.gather(session.task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_stop_is_limited_to_original_author_and_signals_session(tmp_path):
+    bridge = FakeBridge()
+    manager = StreamManager(Settings(), bridge, tmp_path)
+    request = parse_stream_request("21 1 2")
+    from animax.streaming import StreamSession
+
+    session = StreamSession("session", 1, 2, 3, 4, request)
+    session.task = asyncio.create_task(asyncio.sleep(30))
+    manager.session = session
+    try:
+        with pytest.raises(StreamRequestError, match="Only the command author"):
+            await manager.stop(guild_id=1, author_id=99)
+        result = await manager.stop(guild_id=1, author_id=4)
+        assert result["ok"] is True
+        assert session.stop_event.is_set()
+    finally:
+        session.task.cancel()
+        await asyncio.gather(session.task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_stream_start_reservation_blocks_download_launch(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from test_debug_release import build
+
+    client, ctx, *_ = build(tmp_path, monkeypatch)
+    channel = SimpleNamespace(id=200)
+    member = SimpleNamespace(voice=SimpleNamespace(channel=channel))
+    ctx.guild = SimpleNamespace(id=100, get_member=lambda _user_id: member)
+    ctx.author = SimpleNamespace(id=123)
+    ctx.send = AsyncMock()
+    manager = SimpleNamespace(
+        session=None,
+        start=AsyncMock(return_value={"message": "Stream starting."}),
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def ensure_runtime():
+        client.stream_manager = manager
+        entered.set()
+        await release.wait()
+        return manager
+
+    client.ensure_stream_runtime = ensure_runtime
+    command = client.get_command("stream")
+    starting = asyncio.create_task(command.callback(ctx, request="21 1 1"))
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    assert client.stream_starting
+    accepted = await client.launch_job(
+        ctx, ctx.channel, Job(21, "dub", 1, 1, 456), False, fixed_target=ctx.channel
+    )
+    assert accepted is False
+    assert "Go Live stream is active" in ctx.send.await_args.args[0]
+    release.set()
+    await asyncio.wait_for(starting, timeout=2)
+    assert not client.stream_starting
+    manager.start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_episode_preparation_removes_partial_cache(tmp_path):
+    bridge = FakeBridge()
+    manager = StreamManager(Settings(keep_stream_cache=False), bridge, tmp_path)
+    request = parse_stream_request("21 1 2")
+    from animax.streaming import StreamSession
+
+    session = StreamSession("session", 1, 2, 3, 4, request, mal_id=21)
+    session.prefetch_episode = 2
+    session.skip_preparing.add(2)
+    session.prefetch_task = asyncio.create_task(asyncio.Event().wait())
+    work = manager._episode_work(session, 2)
+    work.mkdir(parents=True)
+    (work / "partial.mp4").write_bytes(b"partial")
+    session.prefetch_task.cancel()
+
+    result = await manager._await_prepare(session, 2, session.prefetch_task)
+
+    assert result is SKIPPED
+    assert not work.exists()

@@ -9,7 +9,7 @@ import pytest
 
 from animax.aniskip import normalize_intervals
 from animax.encoding import video_filter
-from animax.media import (
+from animax.stream_media import (
     PROCESSING_VERSION,
     cached_video,
     cut_filter_graph,
@@ -102,7 +102,7 @@ async def test_cache_marker_is_versioned_and_separates_skip_state(
     async def valid_probe(_path):
         return {"format": {"duration": "60"}, "streams": [{"codec_type": "video"}]}
 
-    monkeypatch.setattr("animax.media.probe", valid_probe)
+    monkeypatch.setattr("animax.stream_media.probe", valid_probe)
     cached = await cached_video(work, "sub", 1080, "burn", encoder_preset="ultrafast")
     assert cached is None
     cached = await cached_video(

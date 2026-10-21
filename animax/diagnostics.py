@@ -62,7 +62,7 @@ def error_hint(text: str) -> str:
     if "403" in lower or "forbidden" in lower:
         return "The provider rejected the media request (403). A fresh resolve will be tried; ANIMAX cannot grant access."
     if "429" in lower or "too many requests" in lower:
-        return "The media provider is rate-limiting this request. Stop and wait before retrying."
+        return "The CDN is rate-limiting this IP. Respect the saved cooldown; no episode hopping or immediate fragment retry."
     if "ffmpeg" in lower and ("not found" in lower or "not installed" in lower):
         return "Install FFmpeg and ffprobe on PATH."
     if "requested format" in lower and "not available" in lower:
@@ -79,85 +79,41 @@ def error_hint(text: str) -> str:
 
 
 def dependency_report() -> dict:
-    """Check local CPU-only runtimes without logging in or making network requests."""
+    """No Discord login, no network requests, no credentials in output."""
     if sys.version_info < (3, 10):
-        raise SetupError("Python 3.10+ is required; 3.11+ is recommended.")
+        raise SetupError(
+            "Python 3.10+ is required; 3.11+ is recommended. Use the same interpreter to install dependencies and run the bot."
+        )
     report = {
         "python": sys.version.split()[0],
         "interpreter": sys.executable,
         "packages": {},
     }
-    for name in (
-        "playwright",
-        "yt-dlp",
-        "aiohttp",
-        "python-dotenv",
-        "rich",
-        "rapidfuzz",
-    ):
+    for name in ("discord.py-self", "playwright", "yt-dlp", "aiohttp", "python-dotenv"):
         try:
             report["packages"][name] = metadata.version(name)
         except metadata.PackageNotFoundError:
             raise SetupError(
-                f"{name} is missing from {sys.executable}. Run pip install -r requirements.txt in the same environment."
+                f"{name} is missing from {sys.executable}. Run pip install -r requirements.txt in the same Python environment."
             ) from None
+    for conflicting in ("discord.py", "py-cord"):
+        try:
+            metadata.version(conflicting)
+        except metadata.PackageNotFoundError:
+            pass
+        else:
+            raise SetupError(
+                f"{conflicting} conflicts with discord.py-self. Remove the conflicting package from this Python environment."
+            )
     for executable in ("ffmpeg", "ffprobe"):
         if not shutil.which(executable):
-            raise SetupError(
-                f"{executable} is missing from PATH. Install a current FFmpeg build."
-            )
+            raise SetupError(f"{executable} is missing from PATH. Install FFmpeg.")
         result = subprocess.run(
             [executable, "-version"], capture_output=True, text=True, timeout=20
         )
         if result.returncode:
             raise SetupError(f"{executable} failed: {error_summary(result.stderr)}")
         report[executable] = result.stdout.splitlines()[0]
-    encoders = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-encoders"],
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-    filters = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-filters"],
-        capture_output=True,
-        text=True,
-        timeout=20,
-    )
-    if (
-        encoders.returncode
-        or "libx264" not in encoders.stdout
-        or "aac" not in encoders.stdout
-    ):
-        raise SetupError("FFmpeg must include the CPU libx264 and AAC encoders.")
-    if filters.returncode or "subtitles" not in filters.stdout:
-        raise SetupError(
-            "FFmpeg must include the subtitles/libass filter to burn captions."
-        )
-    if "azmq" not in filters.stdout:
-        raise SetupError(
-            "FFmpeg must include the azmq/libzmq filter used by the Go Live audio pipeline."
-        )
-    report["ffmpeg_codecs"] = (
-        "libx264 + AAC + subtitles/libass + azmq; hardware acceleration is not required"
-    )
-    node = shutil.which("node")
-    if not node:
-        raise SetupError(
-            "Node.js 22.4+ is required for the DAVE-capable Go Live sidecar."
-        )
-    node_version = subprocess.run(
-        [node, "--version"], capture_output=True, text=True, timeout=10
-    )
-    match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", node_version.stdout)
-    version = tuple(map(int, match.groups())) if match else (0, 0, 0)
-    if node_version.returncode or version < (22, 4, 0):
-        raise SetupError(
-            f"Node.js 22.4+ is required; found {node_version.stdout.strip() or 'unknown'}."
-        )
-    report["node"] = node_version.stdout.strip()
-    if not shutil.which("npm"):
-        raise SetupError("npm is required to install the Go Live sidecar packages.")
     result = subprocess.run(
         [sys.executable, "-m", "yt_dlp", "--version"],
         capture_output=True,

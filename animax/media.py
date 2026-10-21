@@ -11,12 +11,11 @@ import sys
 import time
 from pathlib import Path
 
-from .aniskip import get_skip_intervals
 from .diagnostics import error_hint, error_summary
-from .disk import disk_usage
 from .encoding import video_filter
 from .rate_limits import RateLimitError
 from .resolver import Stream, choose_caption
+from .resources import disk_usage
 from .settings import SAFE_OUTPUT_MB
 from .transfer_state import (
     discard_fragment_files,
@@ -40,75 +39,6 @@ class MediaProcessError(MediaError):
         super().__init__(
             f"{program} exited with code {exit_code}:\n{self.summary}\n{self.hint}"
         )
-
-
-def normalize_skip_intervals(intervals, duration: float) -> list[tuple[float, float]]:
-    clean = []
-    for item in intervals or []:
-        try:
-            start = max(0.0, float(item[0]))
-            end = min(duration, float(item[1]))
-        except (TypeError, ValueError, IndexError, OverflowError):
-            continue
-        if start < end and end - start < duration:
-            clean.append((start, end))
-    clean.sort()
-    merged: list[list[float]] = []
-    for start, end in clean:
-        if merged and start <= merged[-1][1] + 0.05:
-            merged[-1][1] = max(merged[-1][1], end)
-        else:
-            merged.append([start, end])
-    return [(start, end) for start, end in merged]
-
-
-def keep_intervals(duration: float, skip_intervals) -> list[tuple[float, float]]:
-    cursor = 0.0
-    keep = []
-    for start, end in normalize_skip_intervals(skip_intervals, duration):
-        if start > cursor:
-            keep.append((cursor, start))
-        cursor = max(cursor, end)
-    if cursor < duration:
-        keep.append((cursor, duration))
-    # Never let malformed or overly broad API timings suppress an entire episode.
-    return keep if keep else [(0.0, duration)]
-
-
-def cut_filter_graph(video_filter: str, segments, has_audio: bool) -> str:
-    count = len(segments)
-    if count < 1:
-        raise ValueError("At least one kept video segment is required.")
-    graph = []
-    if count == 1:
-        graph.append(
-            f"[0:v:0]{video_filter},trim=start={segments[0][0]:.3f}:end={segments[0][1]:.3f},setpts=PTS-STARTPTS[v0]"
-        )
-    else:
-        split_labels = "".join(f"[vsrc{i}]" for i in range(count))
-        graph.append(f"[0:v:0]{video_filter},split={count}{split_labels}")
-        for index, (start, end) in enumerate(segments):
-            graph.append(
-                f"[vsrc{index}]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS[v{index}]"
-            )
-    if has_audio:
-        if count == 1:
-            graph.append(
-                f"[0:a:0]atrim=start={segments[0][0]:.3f}:end={segments[0][1]:.3f},asetpts=PTS-STARTPTS[a0]"
-            )
-        else:
-            split_labels = "".join(f"[asrc{i}]" for i in range(count))
-            graph.append(f"[0:a:0]asplit={count}{split_labels}")
-            for index, (start, end) in enumerate(segments):
-                graph.append(
-                    f"[asrc{index}]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS[a{index}]"
-                )
-        inputs = "".join(f"[v{i}][a{i}]" for i in range(count))
-        graph.append(f"{inputs}concat=n={count}:v=1:a=1[outv][outa]")
-    else:
-        inputs = "".join(f"[v{i}]" for i in range(count))
-        graph.append(f"{inputs}concat=n={count}:v=1:a=0[outv]")
-    return ";".join(graph)
 
 
 def log_tail(path: Path, start: int = 0, count: int = 16000) -> str:
@@ -295,8 +225,12 @@ async def download(
     timeout: int = 3600,
     request_interval: float = 0.25,
     on_progress=None,
-    encoder_preset: str = "ultrafast",
-    encode_threads: int = 2,
+    on_phase=None,
+    subtitle_fallback: bool = False,
+    prepare_timeout: int = 300,
+    encoder_preset: str = "veryfast",
+    upload_limit: int | None = None,
+    encode_threads: int = 4,
     target_mb: int = 450,
     video_crf: int = 19,
     compression_mode: str = "quality",
@@ -304,11 +238,9 @@ async def download(
     lossless: bool = False,
     caption_font: str = "liberation",
     frame_rate: str = "source",
-    disk_root: Path | None = None,
-    skip_intro_outro: bool = False,
-    mal_id: int | None = None,
-    episode: int | None = None,
-    skip_intervals: list[tuple[float, float]] | None = None,
+    resources=None,
+    job=None,
+    transfer_lease=None,
 ) -> tuple[Path, str | None]:
     work.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(work).free < 512 * 1024**2:
@@ -376,7 +308,7 @@ async def download(
                     work,
                     timeout=remaining,
                     max_bytes=max_bytes,
-                    disk_root=disk_root or work,
+                    disk_root=resources.disk_root if resources else None,
                     progress_file=progress_file,
                     on_progress=on_progress,
                 )
@@ -406,6 +338,8 @@ async def download(
                     )
                 if on_progress:
                     on_progress({"fraction": 0, "downloaded": 0, "status": "retrying"})
+                if on_phase:
+                    on_phase("Downloading")
     finally:
         cookie_file.unlink(missing_ok=True)
     source = work / "source.mp4"
@@ -447,7 +381,9 @@ async def download(
         "FRAME_RATE source=%s requested=%s", video.get("avg_frame_rate"), frame_rate
     )
     result = work / "episode.mp4"
-    safe_limit = SAFE_OUTPUT_MB * 1_000_000
+    safe_limit = min(
+        upload_limit or SAFE_OUTPUT_MB * 1_000_000, SAFE_OUTPUT_MB * 1_000_000
+    )
     source_bytes = source.stat().st_size
     if compression_mode not in {"quality", "size"}:
         raise ValueError("Compression mode must be quality or size.")
@@ -465,38 +401,10 @@ async def download(
         selected_crf, selected_mode = 0, "preserve"
         policy = "preserve below safe limit"
     preserve_pass = selected_mode == "preserve"
+    if transfer_lease:
+        transfer_lease.release()
 
-    source_duration = float(original_info["format"]["duration"])
-    effective_skip_intervals = []
-    segments = [(0.0, source_duration)]
-    if skip_intro_outro:
-        if skip_intervals is None and mal_id and episode:
-            skip_intervals = await get_skip_intervals(mal_id, episode, source_duration)
-        effective_skip_intervals = normalize_skip_intervals(
-            skip_intervals, source_duration
-        )
-        segments = keep_intervals(source_duration, effective_skip_intervals)
-    duration = sum(end - start for start, end in segments)
-    if skip_intro_outro and not effective_skip_intervals:
-        note = f"No usable AniSkip OP/ED timing was available for episode {episode}; playing the full episode."
-    log.info(
-        "SKIP_TIMES requested=%s mal_id=%s episode=%s intervals=%s output_duration=%.3f source_duration=%.3f",
-        skip_intro_outro,
-        mal_id,
-        episode,
-        effective_skip_intervals,
-        duration,
-        source_duration,
-    )
-
-    has_audio = any(
-        item.get("codec_type") == "audio" for item in original_info["streams"]
-    )
-    filter_graph = (
-        cut_filter_graph(filters, segments, has_audio)
-        if effective_skip_intervals
-        else None
-    )
+    duration = float(original_info["format"]["duration"])
 
     def encoder_args(crf, mode, destination, file_size_limit=None):
         command = [
@@ -515,15 +423,13 @@ async def download(
         ]
         if subtitle and caption_mode == "mux":
             command += ["-i", str(subtitle)]
-        if filter_graph:
-            command += ["-filter_complex", filter_graph, "-map", "[outv]"]
-            if has_audio:
-                command += ["-map", "[outa]"]
-            else:
-                command += ["-an"]
-        else:
-            command += ["-map", "0:v:0", "-map", "0:a:0?", "-vf", filters]
         command += [
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-vf",
+            filters,
             "-c:v",
             "libx264",
             "-preset",
@@ -553,8 +459,8 @@ async def download(
             ratio = 0.94 if mode == "size" else 0.96
             bitrate = min(8_000_000, int(budget * 8 / duration * ratio - 128000))
             if bitrate < 180000:
-                raise MediaLimitError(
-                    "The episode is too long to fit the safe output-size limit at usable quality."
+                raise UploadTooLarge(
+                    "The episode is too long to fit the safe upload limit at usable quality. No splitting performed."
                 )
             command += ["-maxrate", str(bitrate), "-bufsize", str(bitrate * 2)]
         if subtitle and caption_mode == "mux":
@@ -596,117 +502,118 @@ async def download(
             work,
             timeout=timeout,
             max_bytes=max_bytes,
-            disk_root=disk_root or work,
+            disk_root=resources.disk_root if resources else None,
         )
         return time.monotonic() - started
 
-    try:
-        encode_seconds = await encode_pass(
-            selected_crf, selected_mode, safe_limit if preserve_pass else None
-        )
-    except MediaProcessError:
-        if (
-            not preserve_pass
-            or not result.exists()
-            or result.stat().st_size < safe_limit * 0.90
-        ):
-            raise
-        log.info(
-            "PRESERVE_LIMIT_REACHED; retrying near the configured safe output size"
-        )
-        result.unlink(missing_ok=True)
-        preserve_pass = False
-        selected_crf = video_crf
-        selected_mode = "size" if compression_mode == "size" else "safe"
-        policy = "prepared output needs safe-size compression"
-        encode_seconds = await encode_pass(selected_crf, selected_mode)
+    async with (
+        resources.lease("encode", job) if resources else contextlib.nullcontext()
+    ):
+        if on_phase:
+            on_phase("Enhancing")
+        try:
+            encode_seconds = await encode_pass(
+                selected_crf, selected_mode, safe_limit if preserve_pass else None
+            )
+        except MediaProcessError:
+            if (
+                not preserve_pass
+                or not result.exists()
+                or result.stat().st_size < safe_limit * 0.90
+            ):
+                raise
+            log.info("PRESERVE_LIMIT_REACHED; retrying near the safe upload size")
+            result.unlink(missing_ok=True)
+            preserve_pass = False
+            selected_crf = video_crf
+            selected_mode = "size" if compression_mode == "size" else "safe"
+            policy = "prepared output needs safe-size compression"
+            encode_seconds = await encode_pass(selected_crf, selected_mode)
 
-    needs_safe_fit = False
-    try:
-        result_info = await probe(result)
-        output_duration = float(result_info["format"]["duration"])
-        needs_safe_fit = abs(output_duration - duration) > 3
-    except MediaError:
-        if (
-            not preserve_pass
-            or not result.exists()
-            or result.stat().st_size < safe_limit * 0.90
-        ):
-            raise
-        needs_safe_fit = True
-        result_info = None
+        needs_safe_fit = False
+        try:
+            result_info = await probe(result)
+            output_duration = float(result_info["format"]["duration"])
+            needs_safe_fit = abs(output_duration - duration) > 3
+        except MediaError:
+            if (
+                not preserve_pass
+                or not result.exists()
+                or result.stat().st_size < safe_limit * 0.90
+            ):
+                raise
+            needs_safe_fit = True
+            result_info = None
 
-    if preserve_pass and (needs_safe_fit or result.stat().st_size >= safe_limit):
+        if preserve_pass and (needs_safe_fit or result.stat().st_size >= safe_limit):
+            log.info(
+                "PRESERVE_OUTPUT_EXCEEDS_SAFE_LIMIT input_bytes=%s output_bytes=%s safe_bytes=%s; applying size-safe encode",
+                source_bytes,
+                result.stat().st_size,
+                safe_limit,
+            )
+            result.unlink(missing_ok=True)
+            selected_crf = video_crf
+            selected_mode = "size" if compression_mode == "size" else "safe"
+            policy = "prepared output needs safe-size compression"
+            encode_seconds += await encode_pass(selected_crf, selected_mode)
+            result_info = await probe(result)
+            needs_safe_fit = (
+                abs(float(result_info["format"]["duration"]) - duration) > 3
+            )
+
+        if needs_safe_fit:
+            raise MediaError(
+                "MP4 duration changed unexpectedly; refusing a potentially incomplete episode."
+            )
         log.info(
-            "PRESERVE_OUTPUT_EXCEEDS_SAFE_LIMIT input_bytes=%s output_bytes=%s safe_bytes=%s; applying size-safe encode",
-            source_bytes,
+            "ENCODE_DONE seconds=%.2f media_seconds=%s bytes=%s effective_crf=%s",
+            encode_seconds,
+            result_info["format"].get("duration"),
             result.stat().st_size,
-            safe_limit,
+            selected_crf,
         )
-        result.unlink(missing_ok=True)
-        selected_crf = video_crf
-        selected_mode = "size" if compression_mode == "size" else "safe"
-        policy = "prepared output needs safe-size compression"
-        encode_seconds += await encode_pass(selected_crf, selected_mode)
-        result_info = await probe(result)
-        needs_safe_fit = abs(float(result_info["format"]["duration"]) - duration) > 3
-
-    if needs_safe_fit:
-        raise MediaError(
-            "MP4 duration changed unexpectedly; refusing a potentially incomplete episode."
+        if "mp4" not in result_info["format"].get("format_name", "").split(","):
+            raise MediaError("Final video is not a real MP4 container.")
+        if abs(float(result_info["format"]["duration"]) - duration) > 3:
+            raise MediaError(
+                "MP4 duration changed unexpectedly; refusing a potentially incomplete episode."
+            )
+        source.unlink()
+        (work / "ready.json").write_text(
+            json.dumps(
+                {
+                    "processing_version": PROCESSING_VERSION,
+                    "file": result.name,
+                    "language": language,
+                    "quality": quality,
+                    "subtitle_mode": subtitle_mode,
+                    "encoder_preset": encoder_preset,
+                    "fps": frame_rate,
+                    "source_fps": video.get("avg_frame_rate"),
+                    "output_fps": next(
+                        item
+                        for item in result_info["streams"]
+                        if item.get("codec_type") == "video"
+                    ).get("avg_frame_rate"),
+                    "compression_mode": compression_mode,
+                    "effective_mode": selected_mode,
+                    "target_mb": target_mb if compression_mode == "size" else None,
+                    "video_crf": video_crf,
+                    "effective_crf": selected_crf,
+                    "compress_all": bool(compress_all),
+                    "lossless": bool(lossless),
+                    "caption_font": caption_font,
+                    "safe_output_mb": SAFE_OUTPUT_MB,
+                    "caption_track": track.get("label") if subtitle else None,
+                    "note": note,
+                }
+            )
         )
-    log.info(
-        "ENCODE_DONE seconds=%.2f media_seconds=%s bytes=%s effective_crf=%s",
-        encode_seconds,
-        result_info["format"].get("duration"),
-        result.stat().st_size,
-        selected_crf,
-    )
-    if "mp4" not in result_info["format"].get("format_name", "").split(","):
-        raise MediaError("Final video is not a real MP4 container.")
-    if abs(float(result_info["format"]["duration"]) - duration) > 3:
-        raise MediaError(
-            "MP4 duration changed unexpectedly; refusing a potentially incomplete episode."
-        )
-    source.unlink()
-    (work / "ready.json").write_text(
-        json.dumps(
-            {
-                "processing_version": PROCESSING_VERSION,
-                "file": result.name,
-                "language": language,
-                "skip_intro_outro": bool(skip_intro_outro),
-                "skip_intervals": effective_skip_intervals,
-                "source_duration": source_duration,
-                "output_duration": duration,
-                "quality": quality,
-                "subtitle_mode": subtitle_mode,
-                "encoder_preset": encoder_preset,
-                "fps": frame_rate,
-                "source_fps": video.get("avg_frame_rate"),
-                "output_fps": next(
-                    item
-                    for item in result_info["streams"]
-                    if item.get("codec_type") == "video"
-                ).get("avg_frame_rate"),
-                "compression_mode": compression_mode,
-                "effective_mode": selected_mode,
-                "target_mb": target_mb if compression_mode == "size" else None,
-                "video_crf": video_crf,
-                "effective_crf": selected_crf,
-                "compress_all": bool(compress_all),
-                "lossless": bool(lossless),
-                "caption_font": caption_font,
-                "safe_output_mb": SAFE_OUTPUT_MB,
-                "caption_track": track.get("label") if subtitle else None,
-                "note": note,
-            }
-        )
-    )
-    return result, note
+        return result, note
 
 
-PROCESSING_VERSION = 7
+PROCESSING_VERSION = 6
 
 
 async def cached_video(
@@ -714,7 +621,8 @@ async def cached_video(
     language: str,
     quality: int,
     subtitle_mode: str,
-    encoder_preset="ultrafast",
+    subtitle_fallback=False,
+    encoder_preset="veryfast",
     target_mb=450,
     video_crf=19,
     compression_mode="quality",
@@ -722,47 +630,52 @@ async def cached_video(
     lossless=False,
     caption_font="liberation",
     frame_rate="source",
-    skip_intro_outro=False,
+    pending_upload=False,
 ):
     marker = work / "ready.json"
     if not marker.exists():
         return None
     try:
-        data = json.loads(marker.read_text(encoding="utf-8"))
-        if data.get("processing_version") != PROCESSING_VERSION:
+        data = json.loads(marker.read_text())
+        if data["language"] != language:
             return None
-        if data.get("language") != language:
-            return None
-        if (
-            data.get("quality"),
-            data.get("subtitle_mode"),
-            data.get("encoder_preset"),
-        ) != (
-            quality,
-            subtitle_mode,
-            encoder_preset,
-        ):
-            return None
-        if (
-            data.get("fps"),
-            data.get("target_mb"),
-            data.get("video_crf"),
-            data.get("compression_mode"),
-        ) != (
-            frame_rate,
-            target_mb if compression_mode == "size" else None,
-            video_crf,
-            compression_mode,
-        ):
-            return None
-        if (
-            data.get("compress_all") != bool(compress_all)
-            or data.get("lossless") != bool(lossless)
-            or data.get("caption_font") != caption_font
-            or data.get("safe_output_mb") != SAFE_OUTPUT_MB
-            or data.get("skip_intro_outro", False) != bool(skip_intro_outro)
-        ):
-            return None
+        # A pending send retries the original prepared bytes. Upload intent validates
+        # the account, destination, attachment filename and size before any resend.
+        if not pending_upload:
+            if data.get("processing_version") != PROCESSING_VERSION:
+                return None
+            effective_subtitle_mode = (
+                "none"
+                if data.get("requested_language") == "dub"
+                and data.get("language") == "sub"
+                and data.get("fallback_reason")
+                else subtitle_mode
+            )
+            if (data["quality"], data["subtitle_mode"], data.get("encoder_preset")) != (
+                quality,
+                effective_subtitle_mode,
+                encoder_preset,
+            ):
+                return None
+            if (
+                data.get("fps"),
+                data.get("target_mb"),
+                data.get("video_crf"),
+                data.get("compression_mode"),
+            ) != (
+                frame_rate,
+                target_mb if compression_mode == "size" else None,
+                video_crf,
+                compression_mode,
+            ):
+                return None
+            if (
+                data.get("compress_all") != bool(compress_all)
+                or data.get("lossless") != bool(lossless)
+                or data.get("caption_font") != caption_font
+                or data.get("safe_output_mb") != SAFE_OUTPUT_MB
+            ):
+                return None
         source = work / data["file"]
         if source.is_symlink() or source.parent.resolve() != work.resolve():
             return None
@@ -772,5 +685,106 @@ async def cached_video(
         return None
 
 
-class MediaLimitError(MediaError):
-    """A whole media file cannot meet the configured output-size safety limit."""
+async def fit_whole_video(
+    source: Path,
+    limit: int,
+    *,
+    timeout=3600,
+    max_bytes=8 * 1024**3,
+    encode_threads=2,
+    disk_root=None,
+):
+    if source.stat().st_size <= limit:
+        return source
+    duration = float((await probe(source))["format"]["duration"])
+    for attempt in range(2):
+        bitrate = int(
+            (limit * 8 / duration * (0.96 if attempt == 0 else 0.90)) - 128000
+        )
+        if bitrate < 180000:
+            raise UploadTooLarge(
+                "Whole episode is too long to fit this cap at usable quality; no splitting performed."
+            )
+        result = source.parent / (
+            "fitted-1.mp4" if source.name != "fitted-1.mp4" else "fitted-2.mp4"
+        )
+        await run_process(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-y",
+                "-threads",
+                str(encode_threads),
+                "-filter_threads",
+                "1",
+                "-i",
+                str(source),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-map",
+                "0:s?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-threads",
+                str(encode_threads),
+                "-x264-params",
+                "sync-lookahead=0",
+                "-vsync",
+                "0",
+                "-b:v",
+                str(bitrate),
+                "-maxrate",
+                str(bitrate),
+                "-bufsize",
+                str(bitrate * 2),
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-c:s",
+                "mov_text",
+                "-movflags",
+                "+faststart",
+                str(result),
+            ],
+            source.parent,
+            timeout=timeout,
+            max_bytes=max_bytes,
+            disk_root=disk_root,
+        )
+        actual = await probe(result)
+        if abs(float(actual["format"]["duration"]) - duration) > 3:
+            raise MediaError(
+                "Compressed-video duration mismatch. No truncated file will be uploaded."
+            )
+        if result.stat().st_size <= limit:
+            return result
+    raise UploadTooLarge(
+        "Whole episode is still above the configured cap after compression. No splitting performed."
+    )
+
+
+class UploadTooLarge(MediaError):
+    pass
+
+
+def check_upload_size(source: Path, limit: int) -> Path:
+    """Require one whole MP4; never split, truncate or silently compress it."""
+    if limit < 1:
+        raise ValueError("Upload limit must be positive.")
+    size = source.stat().st_size
+    if size > limit:
+        raise UploadTooLarge(
+            f"Whole episode is {size / 1_000_000:.1f} MB; configured cap is "
+            f"{limit / 1_000_000:.1f} MB. No file uploaded and no splitting performed."
+        )
+    return source

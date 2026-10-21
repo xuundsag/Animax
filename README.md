@@ -1,162 +1,177 @@
 # ANIMAX 2.4.3
 
-ANIMAX resolves an anime by MyAnimeList (MAL) ID or title, prepares episodes locally, and plays them as one continuous **Discord Go Live** session. It keeps one episode active and one next-episode preparation slot—no worker pool, episode uploads, or alternate launcher.
+ANIMAX keeps its existing download, upload, history, routing, recovery, and maintenance commands. Version 2.4.3 adds `.stream` as a separate, optional Go Live feature—it does **not** replace `.download` or the other commands.
 
-> **Account warning:** Go Live is implemented through a self-bot (a normal user account running automation). Discord prohibits self-bots and may terminate accounts that use them. This project does not make that use safe or supported. Read the [Discord self-bot policy](https://support.discord.com/hc/en-us/articles/115002192352-Automated-User-Accounts-Self-Bots) and proceed at your own risk.
+> **Self-bot warning:** ANIMAX automates a normal Discord user account. Discord prohibits self-bots and may terminate accounts that use them. The existing Python client handles commands and uploads; the optional Go Live feature starts a separate Node client session with the same account token. This does not make self-bot use safe or supported. Use at your own risk.
 
 ## Contents
 
 - [Features](#features)
 - [Requirements](#requirements)
-- [Installation](#installation)
-- [Usage](#usage)
+- [Install and start](#install-and-start)
 - [Commands](#commands)
+- [Download and upload](#download-and-upload)
+- [Go Live streaming](#go-live-streaming)
 - [Settings](#settings)
-- [How playback works](#how-playback-works)
+- [Local data and maintenance](#local-data-and-maintenance)
 - [Troubleshooting](#troubleshooting)
 - [Security and third-party components](#security-and-third-party-components)
 
 ## Features
 
-- `.stream` accepts a MAL ID or a title; title searches use AniList/Jikan results and fuzzy matching to choose the closest MAL-linked entry.
-- Starts Go Live in the **command author’s current voice channel**. The command must be posted in a server text channel, and its author must already be in the intended voice channel.
-- Plays an inclusive episode range without requiring someone to enqueue each episode manually.
-- Optional AniSkip opening/ending removal (`Yes`); clips without usable timings, API failures, and missing entries play without cuts.
-- Burns available English captions into the image with the selected bundled font. If the provider has no usable English track, ANIMAX reports that and continues without captions.
-- Inserts a 1080p title card before each episode (for example, “Starting Episode 7 — One Piece”).
-- While episode N is playing, prepares **only episode N+1**. The next segment is added to the same Go Live feed; playback does not use a new launcher or separate Discord session per episode.
-- CPU-only encoding: no GPU or hardware encoder is required. The outgoing video profile is fixed at 1920×1080, 16:9, H.264, 30 fps.
-- One active Go Live series per ANIMAX process. `.skip`, `.stop`, and `.status` control the session.
+- Downloads inclusive episode ranges by MyAnimeList (MAL) ID, prepares whole MP4 files, and uploads them to Discord.
+- Remembers per-anime upload destinations and keeps local delivery history, job state, and recovery information in `anime.json`.
+- Resumes interrupted jobs, verifies uncertain uploads before retrying, and preserves successful episode records.
+- Provides title-aware episode captions, subtitle handling, safe-size compression, configurable fonts and CPU encoding.
+- Keeps existing history search, export, reset, route-refetch, settings, and capacity commands.
+- Adds `.stream` for a continuous 1080p/16:9 CPU-only Go Live series. It fuzzy-matches anime titles, optionally skips AniSkip OP/ED intervals, burns usable English captions with the chosen font, and places a title card before each episode.
+- While streaming episode N, prepares only episode N+1. Download/upload jobs and Go Live playback are kept separate: start one after the other, not concurrently.
+- **No download worker pool:** saved download jobs run one at a time. They remain resumable and cancellable; the configurable worker-count setting was removed.
 
 ## Requirements
 
-- Python 3.10 or newer (3.11+ recommended).
-- Node.js **22.4.0 or newer** and npm. The pinned current Go Live backend is `@dank074/discord-video-stream` 7.0.0 with the `@lng2004/discord.js-selfbot-v13` 3.7.2 client fork. This backend is selected for current DAVE-capable voice/video support; the older v6/selfbot package combination is not used.
-- A recent FFmpeg and FFprobe available on `PATH`, built with:
-  - the CPU `libx264` and AAC encoders;
-  - the `subtitles`/libass filter and `azmq` (libzmq) filter;
-  - MPEG-TS support.
-- Playwright Chromium for observing the provider’s normal embedded player.
-- A CPU with enough capacity to download and encode the next episode while the current episode is streamed. ANIMAX does not assume a GPU; a slower CPU may cause a pause at an episode boundary.
-- Access to Discord, AniList/Jikan, AniSkip, the media provider, and its CDN.
+### Existing download/upload commands
 
-The Go Live library uses native WebRTC/AV dependencies. `npm ci` may need a working C/C++ build toolchain on platforms where compatible native binaries are not available.
+- Python 3.10+ (3.11+ recommended), pip, and the packages in `requirements.txt`.
+- FFmpeg and FFprobe on `PATH`, plus Chromium and its system libraries for the provider player resolver.
+- A Discord account with access to the command, destination, and log channels.
 
-## Installation
+### Optional `.stream` command
 
-1. Install Python, Node.js/npm, and an FFmpeg build meeting the requirements above. Confirm that `python`, `node`, `npm`, `ffmpeg`, and `ffprobe` resolve from your shell.
-2. From the ANIMAX directory, create the private environment file and enter your token locally:
+- Node.js **22.4.0+** and npm. Go Live dependencies are pinned in `package-lock.json` and installed lazily the first time `.stream` is used. Node does not need to be started separately.
+- An FFmpeg build with CPU `libx264`, AAC, `subtitles`/libass, MPEG-TS, and the `azmq`/libzmq filter.
+- Enough CPU and free disk to prepare the next episode while the current episode plays. No GPU is required. A slow CPU or provider may cause a pause at an episode boundary.
+
+The Go Live library uses native WebRTC/AV dependencies. On systems without compatible prebuilt binaries, installing them may require a C/C++ toolchain.
+
+## Install and start
+
+1. Install Python, pip, FFmpeg/FFprobe, and Chromium system libraries. For `.stream`, also install Node.js 22.4+ and npm.
+2. In the project directory, create and edit the private environment file:
 
    ```bash
    cp .env.example .env
    ```
 
-   Edit `.env` and replace `YOUR_USER_TOKEN_HERE` with your own token. Do **not** paste it into chat, commit it, or share log files that may contain account data.
-3. Install the Python and Node dependencies and Chromium:
+   Set `DISCORD_TOKEN` locally. Never paste it into chat or commit `.env`.
+3. Install Python packages and Chromium:
 
    ```bash
    python -m venv .venv
    # Windows PowerShell: .venv\Scripts\Activate.ps1
    # macOS/Linux:       source .venv/bin/activate
    pip install -r requirements.txt
-   npm ci --omit=dev
    python -m playwright install chromium
    ```
 
-   On first launch, `python bot.py` checks the Python/Node/FFmpeg runtime and can install missing project dependencies and Chromium. Node.js and FFmpeg themselves must already be installed.
-4. Start ANIMAX using its **only runtime launcher**:
+4. Start ANIMAX with its only runtime launcher:
 
    ```bash
    python bot.py
    ```
 
-   Do not start the Node sidecar separately. The Python entry point starts and supervises the local, loopback-only Node Go Live sidecar.
+   **Do not launch a second bot or the Node sidecar manually.** The Python entry point supervises the optional sidecar when `.stream` is first requested. Without Node installed, the existing download/upload commands can still be used; `.stream` will report that Node is required.
 
-The Node stream-feed smoke test can be run after dependencies are installed with `npm run check` and `npm run test:feed`. Python checks use `pytest -q` after installing `requirements-dev.txt`.
+For development checks, install `requirements-dev.txt`, then run `pytest -q`. The synthetic Go Live feed test is `npm run test:feed` after Node dependencies have been installed.
 
-## Usage
+## Commands
 
-Join the voice channel where you want the stream to appear, then post a command in a server text channel:
+| Command | Purpose |
+|---|---|
+| `.download MAL_ID dub\|sub START END [resume\|force] [#channel]` | Download, prepare, and upload an inclusive episode range. First use in a server needs the destination channel mention at the end. |
+| `.stream <MAL ID or anime name> <start> <end> [Yes\|No] [sub\|dub]` | Start the separate Go Live feature in the command author’s current voice channel. |
+| `.skip` | Skip the current Go Live episode, or cancel its preparation if playback has not started. |
+| `.stop` | Stop Go Live and leave voice. Only the person who started that stream can control it. |
+| `.status` | Show the serialized download queue and any active Go Live stream. |
+| `.cancel [JOB_ID\|all]` | Cancel download jobs. Use `.stop` to stop Go Live. |
+| `.resume [JOB_ID\|all]` / `.retry` | Resume interrupted or failed downloads using saved destinations and upload checks. |
+| `.history MAL_ID` | Show local delivery totals for an anime. |
+| `.search QUERY` | Find previously uploaded episodes in `anime.json`; this is not a source-catalog search. |
+| `.getlist` | Send the local `anime.json` file. It contains account/channel/message metadata; share carefully. |
+| `.reset` | Request confirmation before clearing local history, saved jobs, and downloaded cache. `.reset cancel` aborts the request. |
+| `.refetch [#channel\|CHANNEL_ID]` | Rebuild missing/empty history from readable channel history. A failed scan leaves the existing history unchanged. |
+| `.settings [FIELD [VALUE]]` | List, inspect, or change validated settings. Settings can only be changed while idle. |
+| `.capacity` | Estimate local CPU, memory, and disk headroom; it is not a hosting or provider guarantee. |
+| `.help [command]` / `.mphelp` | List commands or show one command’s syntax. |
+
+## Download and upload
+
+Example first download in a server:
+
+```text
+.download 21 dub 1 10 #one-piece
+```
+
+The destination is saved for that anime and reused on later runs, so a later command can be:
+
+```text
+.download 21 dub 11 20
+```
+
+Use `resume` (the default) to skip confirmed episodes and recover uncertain uploads. Use `force` only when you intentionally want to resend already-confirmed episodes. ANIMAX uploads whole episodes; it does not split a video. The safe prepared-file limit is 950 MB. If a source or prepared output needs compression, the configured compression and lossless rules apply. See `.settings` and the matching entries in `.env.example` for quality, subtitle, font, retry, upload, storage, and CPU settings.
+
+Only one saved download job runs at a time; additional jobs remain queued in `anime.json`. `.cancel JOB_ID` or `.cancel all` controls downloads, while `.resume`/`.retry` can restart interrupted or failed jobs.
+
+## Go Live streaming
+
+Join the voice channel where you want the stream to appear, then run the command in a server text channel:
 
 ```text
 .stream One Piece 1 100 Yes
 ```
 
-The title is fuzzy-matched to its best MAL-linked result. A MAL ID works too:
+A MAL ID works too:
 
 ```text
 .stream 21 1 12 No
 .stream "Attack on Titan" 1 25 Yes dub
 ```
 
-- `Yes` asks AniSkip for opening/ending intervals; `No` (or omitting the option) keeps the whole episode. The option is case-insensitive.
-- Audio defaults to `sub`. Add `sub` or `dub` as the final option to choose another mode.
-- The range is inclusive and limited to 100 episodes per command.
-- The command author’s **current** voice channel is used; ANIMAX does not choose a random channel or move users.
+- Titles are searched against AniList/Jikan and the best MAL-linked fuzzy match is selected. A numeric query is treated as a MAL ID.
+- The stream joins the **command author’s current voice channel**. The author must already be in that channel.
+- `Yes` requests AniSkip opening and ending timings; `No` or no option plays the full episode. If timings are missing or the API is unavailable, the episode plays without cuts.
+- Audio defaults to `sub`. Add `sub` or `dub` to select a mode. Dub fallback follows `DUB_FALLBACK` and only occurs when dub playback or its usable English captions are positively unavailable.
+- ANIMAX caches prepared episodes under `downloads/stream-cache/`. If an episode is not cached, it resolves, downloads, and prepares it at 1080p with the selected font and optional OP/ED trimming. Missing captions are reported and do not prevent playback.
+- A title card such as “Starting Episode 7 — One Piece” precedes each episode. The card and all episodes are fed through one continuous 1920×1080, 16:9, H.264 Go Live session at 30 fps.
+- While episode N plays, only N+1 is prepared. A slower preparation can pause the series at the episode boundary.
+- Download/upload jobs and `.stream` are intentionally mutually exclusive to avoid competing CPU and disk workloads.
 
-## Commands
-
-| Command | Purpose |
-|---|---|
-| `.stream <MAL ID or title> <start> <end> [Yes\|No] [sub\|dub]` | Match the anime, join the author’s current voice channel, and play the range. |
-| `.skip` | Skip the current episode. If no episode is active yet, cancel the episode currently being prepared and advance. |
-| `.stop` | Stop the active series and leave voice. |
-| `.status` | Show the current phase and the single next-episode slot. |
-| `.settings` | Show runtime settings. Use `.settings <name>` to inspect one setting or `.settings <name> <value>` to change and save it. |
-| `.help` | Show command syntax and a concise safety notice. |
-
-Only the author who started the active series can skip or stop it. A new series cannot start until the current session has ended.
+The Go Live stream is a separate feature from `.download`: it does not create uploaded episode posts or replace anime history and upload records. Its Node sidecar is started automatically by `python bot.py` on first use of `.stream`.
 
 ## Settings
 
-Edit `.env` before startup, or use `.settings` in Discord. Chat changes are written to the ignored `settings.json` file and take precedence over environment defaults on the next launch. Stream output remains fixed at 1080p/16:9.
+Use `.settings` to list settings, `.settings FIELD` to inspect one, and `.settings FIELD VALUE` to change it while idle. Changes are stored in the ignored `settings.json` file and take precedence over environment defaults on the next launch.
 
-| Setting | Default | Meaning |
-|---|---:|---|
-| `CAPTION_FONT` | `liberation` | `liberation`, `dejavu`, `dejavu-serif`, or `dejavu-mono`; bundled font files are in `assets/fonts/`. |
-| `DUB_FALLBACK` | `true` | Fall back to sub only when dub playback or English dub captions are positively unavailable. |
-| `VIDEO_PRESET` | `ultrafast` | CPU x264 preset for episode preparation and live streaming. Slower presets may exceed real time. |
-| `ENCODE_THREADS` | `2` | Per-encode CPU thread limit. |
-| `STREAM_BITRATE_KBPS` | `5000` | Average outgoing video bitrate; valid range 2500–8000 kbps. |
-| `MAX_TEMP_GIB` | `8` | Temporary/cache budget under `downloads/`. |
-| `KEEP_STREAM_CACHE` | `false` | Keep prepared episodes for reuse; when off, a prepared file is removed after it has played. |
-| `REQUEST_INTERVAL` | `0.25` | Minimum interval between media-provider requests. |
-| `RESOLVE_TIMEOUT` | `60` | Time allowed to observe the provider player and locate its stream. |
-| `OPERATION_TIMEOUT` | `7200` | Maximum time allowed for one download/encode operation, in seconds. |
-| `HEADLESS` | `true` | Run the provider-observation browser without a visible window. |
-| `COMPRESS_ALL` | `false` | Preserve source quality below the safety limit unless enabled. |
-| `LOSSLESS` | `false` | When enabled, lossless preparation takes precedence over `COMPRESS_ALL`. |
-| `VIDEO_CRF` | `19` | CRF used when compression is required. |
-| `COMPRESSION_MODE` | `quality` | `quality` or `size` behavior when a safe-size encode is required. |
-| `FRAME_RATE` | `source` | Preparation frame rate; Go Live output is normalized to 30 fps. |
+Important settings include:
 
-The configured temporary-storage limit covers the current episode and the one prefetch slot together. Keeping the stream cache can make later runs faster, but the configured disk limit still applies. The old worker, upload, route, and job settings are not used by v2.4.3.
+- `quality`, `subtitles`, `caption_font`, and `dub_fallback` for downloaded episodes.
+- `compressall`, `lossless`, `crf`, `compress`, `target_size`, and `max_size` for safe output-size and quality behavior.
+- `threads`, `preset`, `fps`, `upload_limit`, and `disk_gib` for local processing, upload, and storage.
+- `stream_bitrate` and `keep_stream_cache` for the optional Go Live feature. Go Live output itself stays fixed at 1080p/16:9/30 fps.
 
-## How playback works
+The former worker-count setting is ignored when loading older `settings.json` files and is no longer configurable. Download jobs are serialized.
 
-1. A name search returns candidates from AniList/Jikan; RapidFuzz ranks the title and selects the best MAL-linked match. A numeric argument is treated as a MAL ID.
-2. ANIMAX joins the command author’s voice channel through the Node sidecar and resolves the requested episode using the provider’s normal player page.
-3. It downloads the source and prepares a whole MP4: 16:9 padding/scaling, selected-font caption burn-in when a usable track exists, and optional AniSkip trims. The trim is applied to video and audio together. AniSkip errors or missing timings fail open to the full episode.
-4. A title card and episode are fed into one continuous CPU H.264 Go Live stream. During episode N, one background task downloads and prepares N+1. ANIMAX waits at the boundary if that preparation is not ready; it does not queue multiple future episodes.
-5. Unless `KEEP_STREAM_CACHE=true`, the prepared episode is removed after its Go Live segment has been consumed. `downloads/` also contains private runtime files and is excluded from version control.
+## Local data and maintenance
+
+- `anime.json` stores job state, per-anime routes, upload messages, and local delivery history. Use `.getlist` carefully: this file contains account/channel/message metadata.
+- `downloads/` holds downloaded and prepared videos, resume fragments, and the separate Go Live cache. `logs/` contains local diagnostics. Both are excluded from version control.
+- `.refetch` only imports data from channel history the account can read; scan errors do not partially replace the journal.
+- `.reset` clears only local history/jobs and downloads after an explicit confirmation. It does not delete Discord messages, `.env`, settings, or cooldown information.
 
 ## Troubleshooting
 
-- **Node version error:** install Node.js 22.4.0 or newer, reopen the shell, and check `node --version` before running `python bot.py`.
-- **Native package or sidecar error:** from the project directory, run `npm ci --omit=dev`; inspect `logs/stream-bridge.log`. Make sure the `@dank074/discord-video-stream` and `@lng2004/discord.js-selfbot-v13` versions match `package-lock.json`.
-- **FFmpeg capability error:** confirm `ffmpeg -encoders` lists `libx264` and AAC and `ffmpeg -filters` lists `subtitles` and `azmq`. Hardware acceleration is not required.
-- **No Go Live start:** ensure the command author is in the intended voice channel and that the account can connect and speak there. Discord-side account restrictions, DAVE negotiation, network conditions, and client updates can still prevent streaming.
-- **Title mismatch:** try the MAL ID or a more distinctive title. If metadata APIs are unavailable, retry later; numeric MAL IDs do not depend on fuzzy matching.
-- **Episode/language unavailable:** verify the provider has mapped that episode and audio mode. Dub fallback is not triggered by generic timeouts or rate limits.
-- **No captions:** the episode may have no usable English WebVTT track. ANIMAX reports the absence and continues without captions; font settings do not create missing subtitle data.
-- **Skip did nothing:** AniSkip may not have timings for that MAL ID/episode, or its API may be unavailable. In either case the episode plays uncut.
-- **Episode boundary pause:** the next episode may still be downloading or encoding. Check available CPU, free disk space, provider speed, `ENCODE_THREADS`, and the `ultrafast` preset.
-- **Logs:** `logs/bot.log` and `logs/stream-bridge.log` are local diagnostics. Keep `.env`, account tokens, and private logs confidential.
+- **Python import/dependency error:** start from the project root, verify `animax/` is present, and run `pip install -r requirements.txt` with the same Python used for `python bot.py`.
+- **Download or upload fails:** inspect `logs/bot.log` and the episode-specific logs. Check destination permissions, free disk, source availability, and rate-limit cooldowns before retrying.
+- **First `.stream` says Node is missing:** install Node.js 22.4+ and npm, reopen the shell, confirm `node --version`, then use `.stream` again. The existing download commands do not require Node.
+- **Native package or Go Live startup error:** inspect `logs/stream-bridge.log`; confirm the pinned packages in `package-lock.json`, FFmpeg `azmq`, and the Node version. The bridge is not tested against every Discord session or host.
+- **No Go Live start:** verify the command author is in the intended voice channel and that the account can connect there. DAVE negotiation, account restrictions, network conditions, and client changes can still prevent streaming.
+- **No AniSkip cut:** that episode may lack OP/ED data, or AniSkip may be unavailable. ANIMAX fails open and plays the full episode.
+- **Episode boundary pause:** the next episode may still be downloading/encoding. Check CPU, free disk, provider speed, and `threads`/`preset`.
 
 ## Security and third-party components
 
-- **Self-bot risk:** Discord states that automating normal user accounts is prohibited and may result in account termination. This software is provided at the user’s risk; no promise of account safety, voice compatibility, or live reliability is made. See [Discord’s voice connection/DAVE documentation](https://docs.discord.com/developers/topics/voice-connections).
-- The Node API binds to `127.0.0.1` and uses a per-run random bearer secret. The Python and Node processes share the token only through the local process environment; it is not printed in the startup banner.
-- Respect the media provider’s terms, copyright law, and AniSkip’s API conditions. ANIMAX does not bypass DRM or provider access controls.
-- Third-party components: [discord-video-stream](https://github.com/Discord-RE/Discord-video-stream), [the DAVE-capable selfbot client fork](https://www.npmjs.com/package/@lng2004/discord.js-selfbot-v13), [AniSkip](https://api.aniskip.com/api-docs), [AniList](https://anilist.co/), and [Jikan](https://jikan.moe/). Bundled DejaVu and Liberation fonts include their license files in `assets/fonts/`.
-- No separate ANIMAX project license file is included in this release; check the repository’s terms before redistribution.
+- Discord prohibits automating normal user accounts and may terminate accounts that do so. The optional Node Go Live sidecar creates a separate client session using the same private token; no live Discord playback or account-safety guarantee is claimed.
+- Keep `.env`, `anime.json`, private logs, and exported `.getlist` attachments confidential. The local stream bridge binds to loopback and uses a per-run random bearer secret.
+- Respect the media provider’s terms, copyright law, Discord rules, and AniSkip’s API conditions. ANIMAX does not bypass DRM or provider access controls.
+- Third-party components include [discord.py-self](https://github.com/dolfies/discord.py-self), [discord-video-stream](https://github.com/Discord-RE/Discord-video-stream), the [DAVE-capable selfbot client fork](https://www.npmjs.com/package/@lng2004/discord.js-selfbot-v13), [AniSkip](https://api.aniskip.com/api-docs), [AniList](https://anilist.co/), and [Jikan](https://jikan.moe/). Bundled fonts include their license files in `assets/fonts/`.
+- No ANIMAX project license file is included in this release; check the repository’s terms before redistribution.

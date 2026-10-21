@@ -1,0 +1,274 @@
+from __future__ import annotations
+
+import logging
+
+import discord
+from discord.ext import commands
+
+from .refetch import refetch_command
+from .reset import handle_reset
+from .search import find_uploads
+from .settings import settings_command
+from .streaming import StreamBusy, StreamRequestError, parse_stream_request
+
+log = logging.getLogger("animax.commands")
+
+COMMAND_HELP = {
+    "capacity": "`.capacity`: estimate local CPU/RAM/disk headroom. Download jobs run one at a time; estimates are not a provider or Discord guarantee.",
+    "download": "`.download MAL_ID dub|sub START END [resume|force] [#channel]`: inclusive range, one whole MP4 each. First use in a server requires the destination channel mention last, e.g. `.download 21 dub 1 10 #one-piece`. Later downloads reuse anime.json and ignore a supplied channel. Force can duplicate confirmed uploads; pending sends are still checked before retry.",
+    "stream": "`.stream <MAL ID or anime name> <start> <end> [Yes|No] [sub|dub]`: start a continuous Go Live series in your current voice channel. Fuzzy title matching; OP/ED skip is optional. Requires Node.js 22.4+ when first used.",
+    "skip": "`.skip`: skip the current Go Live episode, or cancel the episode being prepared if playback has not started.",
+    "stop": "`.stop`: stop the Go Live series and leave voice. Only the person who started it can control it.",
+    "status": "`.status`: show the serialized download queue and any active Go Live stream.",
+    "cancel": "`.cancel [JOB_ID|all]`: stop selected download jobs or queued jobs; history and cached videos remain. `.stop` controls Go Live instead.",
+    "resume": "`.resume [JOB_ID|all]` or `.retry`: queue interrupted/failed jobs; bare resume selects the latest inactive unfinished job. Confirmed episodes are skipped; unresolved uploads are checked. Old jobs keep their saved upload destination.",
+    "history": "`.history MAL_ID`: show local delivery totals for that anime.",
+    "search": "`.search QUERY`: find up to five uploaded episodes. Try `.search One piece episode 1` or `.search eisode 1 onepimse`. Searches anime.json, not the source catalog.",
+    "getlist": "`.getlist`: attach anime.json only. It contains account/channel/message metadata; share carefully.",
+    "reset": "`.reset` asks for confirmation before clearing local anime history, saved jobs and video cache. `.reset cancel` aborts. Existing Discord messages, settings and cooldowns stay.",
+    "refetch": "`.refetch [#channel|CHANNEL_ID]`: rebuild missing/empty anime.json from readable text-history channels in that channel's category, or the entire guild if uncategorized. Defaults to the log channel, then this channel. One transaction; any scan failure leaves history unchanged.",
+    "settings": "`.settings` lists fields. `.settings FIELD` shows valid values. `.settings quality 1080` validates and saves a change while idle.",
+    "help": "`.help [name]`: list commands or show specific syntax.",
+}
+
+
+def parse_download_tail(tail):
+    tokens = str(tail or "").split()
+    mode = "resume"
+    channel_mention = ""
+    if not tokens:
+        return mode, channel_mention
+    if tokens[-1].lower() in {"resume", "force"}:
+        if len(tokens) != 1:
+            raise commands.BadArgument(
+                "Put the destination channel mention at the very end of the command."
+            )
+        return tokens[0].lower(), channel_mention
+    if len(tokens) > 2:
+        raise commands.BadArgument(
+            "Use an optional mode, then one channel mention as the final argument."
+        )
+    if len(tokens) == 2:
+        if tokens[0].lower() not in {"resume", "force"}:
+            raise commands.BadArgument(
+                "Use `[resume|force]` before the final channel mention."
+            )
+        mode = tokens[0].lower()
+    channel_mention = tokens[-1]
+    return mode, channel_mention
+
+
+def register_commands(bot):
+    @bot.command(name="download", ignore_extra=False)
+    async def download_entry(
+        ctx, mal_id: int, language: str, start: int, end: int, *, tail: str = ""
+    ):
+        mode, channel_mention = parse_download_tail(tail)
+        await bot.download_command(
+            ctx, mal_id, language, start, end, mode, channel_mention
+        )
+
+    @bot.command(name="stream", ignore_extra=False)
+    async def stream_entry(ctx, *, request: str):
+        if not getattr(ctx, "guild", None):
+            await ctx.send("Run `.stream` in a server text channel.")
+            return
+        try:
+            parse_stream_request(request)
+        except StreamRequestError as exc:
+            raise commands.BadArgument(str(exc)) from None
+        if bot.busy():
+            await ctx.send(
+                "A download job or maintenance task is active. Wait for it to finish before starting `.stream`."
+            )
+            return
+        member = (
+            ctx.guild.get_member(ctx.author.id)
+            if hasattr(ctx.guild, "get_member")
+            else None
+        )
+        member = member or ctx.author
+        voice = getattr(member, "voice", None)
+        if not getattr(voice, "channel", None):
+            try:
+                member = await ctx.guild.fetch_member(ctx.author.id)
+                voice = getattr(member, "voice", None)
+            except Exception:
+                voice = None
+        channel = getattr(voice, "channel", None)
+        if channel is None:
+            await ctx.send(
+                "Join the voice channel where you want the stream, then run `.stream` again."
+            )
+            return
+        async with bot.activity_lock:
+            if bot.busy():
+                blocked = True
+            else:
+                blocked = False
+                bot.stream_starting = True
+        if blocked:
+            await ctx.send(
+                "A download job or maintenance task started while `.stream` was being prepared. Wait for it to finish, then try again."
+            )
+            return
+        try:
+            manager = await bot.ensure_stream_runtime()
+            result = await manager.start(
+                guild_id=int(ctx.guild.id),
+                voice_channel_id=int(channel.id),
+                text_channel_id=int(ctx.channel.id),
+                author_id=int(ctx.author.id),
+                raw=request,
+            )
+        except StreamBusy as exc:
+            await ctx.send(str(exc))
+            return
+        except (OSError, RuntimeError) as exc:
+            await ctx.send(f".stream could not start: {str(exc)[:1000]}")
+            log.warning(".stream startup failed", exc_info=True)
+            return
+        finally:
+            bot.stream_starting = False
+        await ctx.send(result["message"])
+
+    @bot.command(name="skip", ignore_extra=False)
+    async def skip_stream_entry(ctx):
+        if not getattr(ctx, "guild", None):
+            await ctx.send("Run `.skip` in the server where the stream started.")
+            return
+        if not bot.stream_manager:
+            await ctx.send("No active Go Live stream.")
+            return
+        try:
+            result = await bot.stream_manager.skip(
+                guild_id=int(ctx.guild.id), author_id=int(ctx.author.id)
+            )
+        except StreamRequestError as exc:
+            await ctx.send(str(exc))
+            return
+        await ctx.send(result["message"])
+
+    @bot.command(name="stop", ignore_extra=False)
+    async def stop_stream_entry(ctx):
+        if not getattr(ctx, "guild", None):
+            await ctx.send("Run `.stop` in the server where the stream started.")
+            return
+        if not bot.stream_manager:
+            await ctx.send("No active Go Live stream.")
+            return
+        try:
+            result = await bot.stream_manager.stop(
+                guild_id=int(ctx.guild.id), author_id=int(ctx.author.id)
+            )
+        except StreamRequestError as exc:
+            await ctx.send(str(exc))
+            return
+        await ctx.send(result["message"])
+
+    @bot.command(name="status", ignore_extra=False)
+    async def status_entry(ctx):
+        lines = [bot.scheduler.status_text()]
+        if bot.stream_starting:
+            lines.append("Go Live sidecar is starting for `.stream`.")
+        if bot.stream_manager:
+            stream_status = bot.stream_manager.status(
+                ctx.guild.id if getattr(ctx, "guild", None) else None
+            )
+            if stream_status.get("phase") or "No active" not in stream_status.get(
+                "message", ""
+            ):
+                lines.append(stream_status["message"])
+        await ctx.send("\n".join(lines)[:1900])
+
+    @bot.command(name="cancel", ignore_extra=False)
+    async def cancel_entry(ctx, selector: str = ""):
+        if bot.refetch_task and not bot.refetch_task.done():
+            bot.refetch_task.cancel()
+            await ctx.send("Cancelling refetch. Existing history stays unchanged.")
+        else:
+            await ctx.send(await bot.scheduler.cancel(selector))
+
+    @bot.command(name="help", aliases=["mphelp"], ignore_extra=False)
+    async def help_entry(ctx, name: str = ""):
+        if name:
+            command = bot.get_command(name.lstrip(".").lower())
+            await ctx.send(
+                COMMAND_HELP[command.name] if command else "Unknown command. Use .help."
+            )
+            return
+        names = ", ".join(COMMAND_HELP)
+        await ctx.send(f"**Commands**\n```\n{names}\n```")
+
+    @bot.command(name="search", ignore_extra=False)
+    async def search_entry(ctx, *, query: str):
+        lines = []
+        for result in find_uploads(bot.library.data, query, bot.user.id):
+            url = result.get("jump_url")
+            if not url:
+                try:
+                    channel = await bot.channel_for(result["channel_id"])
+                    guild = getattr(channel, "guild", None)
+                    url = f"https://discord.com/channels/{guild.id if guild else '@me'}/{result['channel_id']}/{result['message_id']}"
+                except Exception:
+                    log.warning("Cannot resolve legacy search permalink", exc_info=True)
+                    continue
+            title = discord.utils.escape_markdown(result["title"])
+            lines.append(f"{title} `E{result['episode']}` : [Click here]({url})")
+        await ctx.send("\n".join(lines) if lines else "No matching uploaded episodes.")
+
+    @bot.command(name="getlist", ignore_extra=False)
+    async def getlist_entry(ctx):
+        async with bot.scheduler.resources.lease("upload", None):
+            # Atomic journal replacements leave this open file snapshot valid.
+            attachment = discord.File(str(bot.library.path), filename="anime.json")
+            try:
+                await ctx.send(file=attachment)
+            finally:
+                attachment.close()
+
+    @bot.command(name="history", ignore_extra=False)
+    async def history_entry(ctx, mal_id: int):
+        await ctx.send(bot.library.summary(mal_id).replace("\n", " | "))
+
+    @bot.command(name="resume", aliases=["retry"], ignore_extra=False)
+    async def resume_entry(ctx, selector: str = ""):
+        records = [
+            dict(record, id=key)
+            for key, record in bot.library.data["jobs"].items()
+            if str(record.get("account_id")) == str(bot.user.id)
+            and record.get("status") != "finished"
+            and not bot.scheduler.contains(key)
+        ]
+        if selector.lower() != "all":
+            records = (
+                [r for r in records if r["id"] == selector]
+                if selector
+                else sorted(records, key=lambda r: r.get("updated_at", ""))[-1:]
+            )
+        if not records:
+            await ctx.send(
+                "No matching resumable job for this account. Use .status for active/queued jobs."
+            )
+        for record in records:
+            await bot.resume_record(record, ctx)
+
+    @bot.command(name="capacity", ignore_extra=False)
+    async def capacity_entry(ctx):
+        from .capacity import report_text
+
+        await ctx.send(
+            "```\n" + report_text(bot.library.path.parent, bot.cfg) + "\n```"
+        )
+
+    @bot.command(name="reset", ignore_extra=False)
+    async def reset_entry(ctx, action: str = "", token: str = ""):
+        await handle_reset(bot, ctx, action, token)
+
+    @bot.command(name="settings", ignore_extra=False)
+    async def settings_entry(ctx, field: str = "", *, value: str = ""):
+        await settings_command(bot, ctx, field, value)
+
+    @bot.command(name="refetch", ignore_extra=False)
+    async def refetch_entry(ctx, destination: str = ""):
+        await refetch_command(bot, ctx, destination)

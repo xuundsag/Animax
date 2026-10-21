@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import shlex
 import shutil
@@ -14,7 +13,6 @@ from pathlib import Path
 
 from .bridge import BridgeError, StreamBridge
 from .encoding import FONT_FILES
-from .media import MediaError, cached_video, download, probe
 from .metadata import TitleError, resolve_anime
 from .resolver import (
     CaptionUnavailable,
@@ -22,7 +20,8 @@ from .resolver import (
     choose_caption,
     resolve_with_fallback,
 )
-from .settings import FIELDS, Settings, settings_text
+from .settings import Settings
+from .stream_media import MediaError, cached_video, download, probe
 from .titlecard import create_title_card
 
 log = logging.getLogger("animax.streaming")
@@ -291,6 +290,8 @@ class StreamManager:
         try:
             return await task
         except asyncio.CancelledError:
+            if not self.settings.keep_stream_cache:
+                shutil.rmtree(self._episode_work(session, episode), ignore_errors=True)
             if session.stop_event.is_set():
                 return None
             if episode in session.skip_preparing:
@@ -299,6 +300,10 @@ class StreamManager:
                     session, f"Preparation of E{episode} was cancelled; advancing."
                 )
                 return SKIPPED
+            raise
+        except Exception:
+            if not self.settings.keep_stream_cache:
+                shutil.rmtree(self._episode_work(session, episode), ignore_errors=True)
             raise
         finally:
             if session.prepare_task is task:
@@ -433,7 +438,11 @@ class StreamManager:
                     if next_prepared is SKIPPED:
                         episode = next_episode + 1
                         continue
-                    if next_prepared is None or session.stop_event.is_set():
+                    if next_prepared is None:
+                        break
+                    if session.stop_event.is_set():
+                        if not self.settings.keep_stream_cache:
+                            shutil.rmtree(next_prepared.work, ignore_errors=True)
                         break
                     prepared = next_prepared
                     episode = next_episode
@@ -456,14 +465,24 @@ class StreamManager:
             log.exception("Unexpected stream session failure %s", session.id)
             terminal = "failed"
         finally:
+            pending_episodes = {
+                episode
+                for episode in (session.preparing_episode, session.prefetch_episode)
+                if episode is not None
+            }
             for task in (session.prepare_task, session.prefetch_task):
                 if task and not task.done():
                     task.cancel()
             pending = [t for t in (session.prepare_task, session.prefetch_task) if t]
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
-            if prepared and not self.settings.keep_stream_cache:
-                shutil.rmtree(prepared.work, ignore_errors=True)
+            if not self.settings.keep_stream_cache:
+                for episode in pending_episodes:
+                    shutil.rmtree(
+                        self._episode_work(session, episode), ignore_errors=True
+                    )
+                if prepared:
+                    shutil.rmtree(prepared.work, ignore_errors=True)
             if session.series_started:
                 if terminal in {"stopped", "failed"}:
                     with contextlib.suppress(BridgeError):
@@ -542,23 +561,26 @@ class StreamManager:
             disk_root=self.disk_root,
         )
 
-    async def _prepare_episode(self, session: StreamSession, episode: int):
+    def _episode_work(self, session: StreamSession, episode: int) -> Path:
         if session.mal_id is None:
             raise MediaError(
                 "Cannot prepare an episode before anime metadata is resolved."
             )
         skip_tag = "skip" if session.request.skip_intro_outro else "full"
-        work = (
+        return (
             self.cache_root
             / f"mal-{session.mal_id}"
             / f"{session.request.language}-e{episode:04d}-{skip_tag}"
         )
+
+    async def _prepare_episode(self, session: StreamSession, episode: int):
+        work = self._episode_work(session, episode)
         work.mkdir(parents=True, exist_ok=True)
         cfg = self.settings
         cached = await cached_video(
             work,
             session.request.language,
-            cfg.quality,
+            1080,
             "burn",
             encoder_preset=cfg.encoder_preset,
             target_mb=cfg.target_mb,
@@ -619,7 +641,7 @@ class StreamManager:
                     transfer,
                     work,
                     actual_language,
-                    quality=cfg.quality,
+                    quality=1080,
                     subtitle_mode="burn",
                     max_bytes=cfg.max_temp_bytes,
                     timeout=cfg.operation_timeout,
@@ -644,39 +666,3 @@ class StreamManager:
         info = await probe(path)
         duration = float(info["format"]["duration"])
         return PreparedEpisode(episode, work, path, duration, note)
-
-    async def settings_result(self, name: str = "", value: str = ""):
-        if not name:
-            return {"ok": True, "message": settings_text(self.settings)}
-        alias = name.casefold()
-        key = self.settings.set(name, value) if value else None
-        if key is None:
-            from .settings import ALIASES
-
-            key = ALIASES.get(alias, alias)
-            if key not in FIELDS:
-                raise StreamRequestError(
-                    "Unknown setting. Use `.settings` to list valid settings."
-                )
-            field = FIELDS[key]
-            return {
-                "ok": True,
-                "message": f"{key}: {field.display(self.settings)} (valid options: {field.options}).",
-            }
-        path = self.root / "settings.json"
-        try:
-            saved = (
-                json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-            )
-        except (OSError, ValueError):
-            saved = {}
-        if not isinstance(saved, dict):
-            saved = {}
-        saved = {name: value for name, value in saved.items() if name in FIELDS}
-        field = FIELDS[key]
-        saved[key] = field.display(self.settings)
-        path.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
-        return {
-            "ok": True,
-            "message": f"Updated `{key}` to `{field.display(self.settings)}`.\n\n{settings_text(self.settings)}",
-        }

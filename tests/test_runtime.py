@@ -6,9 +6,9 @@ from pathlib import Path
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from animax.bootstrap import _version_tuple
-from animax.bot import create_api
-from animax.settings import Settings
+from animax.settings import FIELDS, Settings
+from animax.stream_api import create_api
+from animax.stream_runtime import _version_tuple
 from animax.streaming import StreamManager
 
 
@@ -24,9 +24,7 @@ def test_node_runtime_version_parser():
     assert _version_tuple("unknown") is None
 
 
-def test_old_worker_settings_are_ignored_and_stream_is_fixed_1080p(
-    tmp_path, monkeypatch
-):
+def test_legacy_worker_settings_are_ignored_but_download_settings_remain(tmp_path):
     path = tmp_path / "settings.json"
     path.write_text(
         json.dumps(
@@ -39,12 +37,14 @@ def test_old_worker_settings_are_ignored_and_stream_is_fixed_1080p(
             }
         )
     )
-    monkeypatch.delenv("CAPTION_FONT", raising=False)
     settings = Settings.from_env(path)
-    assert settings.quality == 1080
+    assert settings.quality == 720
     assert settings.caption_font == "dejavu-serif"
+    assert settings.upload_mode == "auto"
     assert not hasattr(settings, "max_workers")
-    assert not hasattr(settings, "upload_mode")
+    assert "workers" not in FIELDS
+    assert settings.keep_stream_cache is False
+    assert settings.stream_bitrate_kbps == 5000
 
 
 def test_package_pins_current_dave_compatible_sidecar():
@@ -59,24 +59,22 @@ def test_package_pins_current_dave_compatible_sidecar():
 
 
 @pytest.mark.asyncio
-async def test_local_bridge_requires_secret_and_returns_worker_free_settings(tmp_path):
+async def test_local_stream_api_requires_secret_and_has_public_health(tmp_path):
     secret = "local-test-secret"
     manager = StreamManager(Settings(), NullBridge(), tmp_path)
     client = TestClient(TestServer(create_api(manager, secret)))
     await client.start_server()
     try:
-        denied = await client.post("/settings/get", json={})
+        denied = await client.post("/stream/status", json={})
         assert denied.status == 401
         health = await client.get("/health")
         assert health.status == 200
+        assert (await health.json())["service"] == "animax-stream-coordinator"
         authorized = await client.post(
-            "/settings/get",
-            json={},
+            "/internal/series-event",
+            json={"seriesId": "unknown"},
             headers={"Authorization": f"Bearer {secret}"},
         )
-        payload = await authorized.json()
         assert authorized.status == 200
-        assert "workers: removed" in payload["message"]
-        assert "1080p" in payload["message"]
     finally:
         await client.close()
