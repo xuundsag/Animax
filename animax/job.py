@@ -72,5 +72,4 @@ class Job:
             parts.append(f"{math.ceil(self.cooldown_until - time.time())}s")
         if self.error:
             parts.append(" ".join(self.error.split())[:260])
-        prefix = f"W{self.worker_id} : " if self.worker_id else ""
-        return prefix + " | ".join(parts)
+        return " | ".join(parts)

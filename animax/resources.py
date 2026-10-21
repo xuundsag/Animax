@@ -82,7 +82,7 @@ def disk_usage(root):
 class Plan:
     requested_threads: int
     encoder_threads: int
-    active_workers: int
+    active_jobs: int
     download_lanes: int = 1
     encoder_lanes: int = 1
     upload_lanes: int = 1
@@ -92,33 +92,8 @@ class Plan:
 
 
 def plan_capacity(cfg, host):
-    memory_slots = max(
-        1, (host["available_memory_bytes"] - 512 * 1024**2) // (384 * 1024**2)
-    )
-    disk_slots = max(
-        1, min(cfg.max_temp_bytes, max(0, host["free_disk_bytes"] - GiB)) // (2 * GiB)
-    )
-    workers = max(1, min(cfg.max_workers or 3, memory_slots, disk_slots, 8))
-    return Plan(
-        cfg.encode_threads, min(cfg.encode_threads, host["cpu_slots"]), int(workers)
-    )
-
-
-def apply_cpu_budget(threads):
-    """Linux affinity bounds eligible logical CPUs, not the number of OS threads."""
-    if not hasattr(os, "sched_setaffinity"):
-        return False
-    cpus = set(BASE_CPUS[: max(1, threads)])
-    try:
-        os.sched_setaffinity(0, cpus)
-        for task in Path("/proc/self/task").iterdir():
-            try:
-                os.sched_setaffinity(int(task.name), cpus)
-            except ProcessLookupError:
-                pass
-        return True
-    except OSError:
-        return False
+    """Keep one serialized download job; size encoder threads to local CPU slots."""
+    return Plan(cfg.encode_threads, min(cfg.encode_threads, host["cpu_slots"]), 1)
 
 
 class Lease:

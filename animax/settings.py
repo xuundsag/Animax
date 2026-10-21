@@ -14,7 +14,6 @@ SAFE_OUTPUT_MB = 950
 @dataclass
 class Settings:
     channel_id: int = 0  # Legacy internal attribute; public setting is log_channel.
-    max_workers: int = 0
     upload_mb: int = 1000
     quality: int = 1080
     subtitle_mode: str = "burn"
@@ -39,6 +38,7 @@ class Settings:
     caption_font: str = "liberation"
     subtitle_fallback: bool = False
     keep_downloads: bool = False
+    keep_stream_cache: bool = False
     upload_timeout: int = 1800
     upload_mode: str = "auto"
     upload_attempts: int = 2
@@ -55,6 +55,7 @@ class Settings:
     compression_mode: str = "quality"
     frame_rate: str = "source"
     refetch_timeout: int = 600
+    stream_bitrate_kbps: int = 5000
 
     @classmethod
     def from_env(cls, path: Path | None = None):
@@ -149,9 +150,6 @@ FIELDS = {
             "slow",
         ),
     ),
-    "workers": SettingField(
-        "max_workers", "MAX_ACTIVE_WORKERS", int, minimum=0, maximum=8
-    ),
     "threads": SettingField(
         "encode_threads", "ENCODE_THREADS", int, minimum=1, maximum=16
     ),
@@ -189,6 +187,10 @@ FIELDS = {
     ),
     "upload_delay": SettingField("delay", "UPLOAD_DELAY", int, minimum=1, maximum=300),
     "keep_downloads": SettingField("keep_downloads", "KEEP_DOWNLOADS", bool),
+    "keep_stream_cache": SettingField("keep_stream_cache", "KEEP_STREAM_CACHE", bool),
+    "stream_bitrate": SettingField(
+        "stream_bitrate_kbps", "STREAM_BITRATE_KBPS", int, minimum=2500, maximum=8000
+    ),
     "auto_resume": SettingField("auto_resume", "AUTO_RESUME", bool),
     "upload_mode": SettingField(
         "upload_mode", "UPLOAD_MODE", choices=("auto", "cloud", "multipart")
@@ -254,6 +256,8 @@ def read_overrides(path: Path):
     if isinstance(data, dict):
         if "channel" in data:
             data.setdefault("log_channel", data.pop("channel"))
+        for legacy in ("workers", "max_workers", "max_active_workers"):
+            data.pop(legacy, None)
         data.pop(
             "reencode", None
         )  # v2.4 fitting was opt-in; safe-limit fitting is automatic now.
@@ -333,6 +337,10 @@ async def settings_command(bot, ctx, name: str = "", value: str = ""):
         await ctx.send(f"{name}: {exc}")
         return
     bot.cfg = updated
+    if getattr(bot, "stream_manager", None):
+        bot.stream_manager.settings = updated
+    if getattr(bot, "stream_runtime", None):
+        bot.stream_runtime.settings = updated
     if hasattr(bot, "scheduler"):
         bot.scheduler.configure()
     text = f"{name} = {spec.display(updated)} | Saved."

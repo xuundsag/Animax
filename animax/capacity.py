@@ -7,7 +7,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .resources import GiB, apply_cpu_budget, disk_usage, host_capacity, plan_capacity
+from .resources import GiB, disk_usage, host_capacity, plan_capacity
 
 
 def report(root, cfg):
@@ -17,7 +17,7 @@ def report(root, cfg):
         "plan": plan_capacity(cfg, host).data(),
         "cache_bytes": disk_usage(root / "downloads"),
         "disk_budget_bytes": cfg.max_temp_bytes,
-        "limitations": "Heuristic, not a guaranteed maximum. Queue size is limited by RAM/disk. One transfer, one encoder and one uploader can overlap. Encoder threads are shared, not multiplied per worker. CPU affinity limits eligible logical CPUs on Linux, not total OS threads. Provider/Discord concurrency is not tested.",
+        "limitations": "Local headroom estimates only, not a provider or Discord guarantee. Download jobs are serialized to one active job; encode/upload stages are bounded. Go Live streaming is a separate optional command and is not included in this estimate.",
     }
 
 
@@ -31,16 +31,15 @@ def report_text(root, cfg):
             f"Available RAM: {host['available_memory_bytes'] / GiB:.2f} GiB",
             f"Free disk: {host['free_disk_bytes'] / GiB:.2f} GiB",
             f"Cache: {data['cache_bytes'] / GiB:.2f} / {cfg.max_temp_bytes / GiB:.2f} GiB",
-            f"Suggested active anime jobs: {plan['active_workers']} (heuristic)",
-            "Shared slots: download 1 | encode 1 | upload 1",
-            "Additional jobs wait in anime.json; no task per queued job.",
+            "Concurrent download jobs: 1 (fixed)",
+            "Shared stages: transfer 1 | encode 1 | upload 1",
+            "Additional jobs wait in anime.json and run one at a time.",
             "Not a VPS/provider/Discord reliability guarantee. Benchmark while idle.",
         ]
     )
 
 
 def benchmark(root, cfg, plan):
-    applied = apply_cpu_budget(plan["encoder_threads"])
     with tempfile.TemporaryDirectory(prefix=".capacity-", dir=root) as folder:
         output = Path(folder) / "synthetic.mp4"
         command = [
@@ -84,6 +83,5 @@ def benchmark(root, cfg, plan):
             preset=cfg.encoder_preset,
             crf=cfg.video_crf,
             encoder_threads=plan["encoder_threads"],
-            cpu_affinity_applied=applied,
             note="Synthetic encode only; not an episode, source download, Discord upload or sustained thermal/memory stress test.",
         )

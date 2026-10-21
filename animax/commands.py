@@ -13,10 +13,9 @@ from .settings import settings_command
 log = logging.getLogger("animax.commands")
 
 COMMAND_HELP = {
-    "capacity": "`.capacity`: estimated local CPU/RAM/disk capacity, not a provider concurrency guarantee.",
     "download": "`.download MAL_ID dub|sub START END [resume|force] [#channel]`: inclusive range, one whole MP4 each. First use in a server requires the destination channel mention last, e.g. `.download 21 dub 1 10 #one-piece`. Later downloads reuse anime.json and ignore a supplied channel. Force can duplicate confirmed uploads; pending sends are still checked before retry.",
-    "status": "`.status`: show active workers, queued job IDs and shared capacity.",
-    "cancel": "`.cancel [W1|JOB_ID|all]`: stop selected workers or queued jobs; history and cached videos remain. Bare cancel requires one active worker or one queued job.",
+    "status": "`.status`: show the serialized download queue and any active Go Live stream.",
+    "cancel": "`.cancel [JOB_ID|all]`: stop selected download jobs or queued jobs; history and cached videos remain. Stream controls use the `?` prefix on the separate streaming account.",
     "resume": "`.resume [JOB_ID|all]` or `.retry`: queue interrupted/failed jobs; bare resume selects the latest inactive unfinished job. Confirmed episodes are skipped; unresolved uploads are checked. Old jobs keep their saved upload destination.",
     "history": "`.history MAL_ID`: show local delivery totals for that anime.",
     "search": "`.search QUERY`: find up to five uploaded episodes. Try `.search One piece episode 1` or `.search eisode 1 onepimse`. Searches anime.json, not the source catalog.",
@@ -66,7 +65,18 @@ def register_commands(bot):
 
     @bot.command(name="status", ignore_extra=False)
     async def status_entry(ctx):
-        await ctx.send(bot.scheduler.status_text())
+        lines = [bot.scheduler.status_text()]
+        if bot.stream_starting:
+            lines.append("The separate `?` stream command listener is starting.")
+        if bot.stream_manager:
+            stream_status = bot.stream_manager.status(
+                ctx.guild.id if getattr(ctx, "guild", None) else None
+            )
+            if stream_status.get("phase") or "No active" not in stream_status.get(
+                "message", ""
+            ):
+                lines.append(stream_status["message"])
+        await ctx.send("\n".join(lines)[:1900])
 
     @bot.command(name="cancel", ignore_extra=False)
     async def cancel_entry(ctx, selector: str = ""):
@@ -139,14 +149,6 @@ def register_commands(bot):
             )
         for record in records:
             await bot.resume_record(record, ctx)
-
-    @bot.command(name="capacity", ignore_extra=False)
-    async def capacity_entry(ctx):
-        from .capacity import report_text
-
-        await ctx.send(
-            "```\n" + report_text(bot.library.path.parent, bot.cfg) + "\n```"
-        )
 
     @bot.command(name="reset", ignore_extra=False)
     async def reset_entry(ctx, action: str = "", token: str = ""):

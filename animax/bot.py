@@ -43,6 +43,8 @@ from .routing import LogContext, Router, category_id
 from .scheduler import Entry, Scheduler
 from .settings import SAFE_OUTPUT_MB, Settings
 from .storage import Library
+from .stream_media import is_video_attachment
+from .stream_runtime import StreamRuntime
 from .terminal import Terminal, nice_error, setup_logging
 from .upload import JournalCommitFailure, UploadFailure, upload_episode
 
@@ -60,7 +62,7 @@ def validate_request(mal, language, start, end, maximum):
 
 
 class MegaPlayBot(commands.Bot):
-    def __init__(self, settings: Settings, library: Library, ui=None):
+    def __init__(self, settings: Settings, library: Library, ui=None, token=""):
         super().__init__(
             command_prefix=".",
             strip_after_prefix=True,
@@ -69,8 +71,15 @@ class MegaPlayBot(commands.Bot):
             allowed_mentions=discord.AllowedMentions.none(),
         )
         self.cfg, self.library, self.ui = settings, library, ui or Terminal(quiet=True)
+        self.token = token or os.getenv("DISCORD_TOKEN", "").strip()
+        self.stream_token = os.getenv("STREAM_DISCORD_TOKEN", "").strip()
+        self.stream_runtime = None
+        self.stream_manager = None
+        self.stream_listener_task = None
+        self.stream_starting = False
+        self.activity_lock = asyncio.Lock()
         self.cdn_cooldown = Cooldown(ROOT / "cdn_cooldown.json")
-        self.job = self.worker = None
+        self.job = None
         self.reset_request = None
         self.reset_task = None
         self.refetch_task = None
@@ -85,10 +94,143 @@ class MegaPlayBot(commands.Bot):
         register_commands(self)
 
     def busy(self):
-        return self.scheduler.busy() or any(
-            task is not None and not task.done()
-            for task in (self.worker, self.reset_task, self.refetch_task)
+        stream_session = self.stream_manager.session if self.stream_manager else None
+        stream_active = bool(
+            stream_session and stream_session.task and not stream_session.task.done()
         )
+        return (
+            self.scheduler.busy()
+            or stream_active
+            or self.stream_starting
+            or any(
+                task is not None and not task.done()
+                for task in (self.reset_task, self.refetch_task)
+            )
+        )
+
+    async def ensure_stream_runtime(self):
+        if not self.stream_token or self.stream_token.startswith("YOUR_"):
+            raise RuntimeError(
+                "Set STREAM_DISCORD_TOKEN in .env to a separate streaming user account to enable the `?` command listener."
+            )
+        if self.stream_token == self.token:
+            raise RuntimeError(
+                "STREAM_DISCORD_TOKEN must be a different account token from DISCORD_TOKEN."
+            )
+        if self.stream_runtime is None:
+            command_user_id = str(self.user.id) if self.user else None
+            self.ui.event(
+                "STREAM | Starting the ? command listener and Go Live sidecar (separate account).",
+                "cyan",
+            )
+            self.stream_runtime = StreamRuntime(
+                self.stream_token,
+                self.cfg,
+                ROOT,
+                command_user_id=command_user_id,
+                library=self.library,
+                attachment_lookup=self.stream_attachment_for_record,
+                voice_lookup=self.stream_voice_channel_for,
+                stream_guard=self.stream_guard,
+                ui=self.ui,
+            )
+        self.stream_manager = await self.stream_runtime.start()
+        return self.stream_manager
+
+    async def stream_attachment_for_record(self, record):
+        """Fetch the stored Discord message with the main command-only account."""
+        channel_id = str(record.get("channel_id") or "")
+        message_id = str(record.get("message_id") or "")
+        if not channel_id.isdecimal() or not message_id.isdecimal():
+            raise RuntimeError(
+                "anime.json contains an invalid upload channel/message ID."
+            )
+        try:
+            channel = await self.channel_for(channel_id)
+            message = await channel.fetch_message(int(message_id))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not fetch saved Discord message {message_id} from channel {channel_id} "
+                f"({type(exc).__name__}: {str(exc)[:240]}). Check that the main account can read that channel."
+            ) from exc
+
+        attachments = list(getattr(message, "attachments", ()) or ())
+        videos = [
+            attachment
+            for attachment in attachments
+            if is_video_attachment(
+                getattr(attachment, "filename", ""),
+                getattr(attachment, "content_type", None),
+            )
+        ]
+        if not videos:
+            raise RuntimeError(
+                f"Saved Discord message {message_id} has no recognizable video attachment."
+            )
+        attachment = max(videos, key=lambda item: int(getattr(item, "size", 0) or 0))
+        url = str(getattr(attachment, "url", "") or "")
+        if not url:
+            raise RuntimeError(
+                f"Discord returned no current attachment URL for saved message {message_id}."
+            )
+        self.ui.event(
+            f"STREAM | fetched anime.json message={message_id} channel={channel_id} "
+            f"file={getattr(attachment, 'filename', 'video')} "
+            f"size={int(getattr(attachment, 'size', 0) or 0)} bytes",
+            "cyan",
+        )
+        return {
+            "url": url,
+            "filename": str(getattr(attachment, "filename", "episode-video")),
+            "content_type": getattr(attachment, "content_type", None),
+            "size": int(getattr(attachment, "size", 0) or 0),
+            "message_id": str(message.id),
+            "channel_id": str(channel.id),
+        }
+
+    def stream_guard(self):
+        if self.reset_task and not self.reset_task.done():
+            return "History reset is active; wait for it to finish before starting a stream."
+        if self.refetch_task and not self.refetch_task.done():
+            return "History refetch is active; wait for it to finish before starting a stream."
+        return None
+
+    async def stream_voice_channel_for(self, guild_id: int, author_id: int):
+        """Fallback voice-state lookup for a ?stream command when Node has no cached member."""
+        try:
+            guild = self.get_guild(int(guild_id)) or await self.fetch_guild(
+                int(guild_id)
+            )
+            member = guild.get_member(int(author_id))
+            if member is None:
+                member = await guild.fetch_member(int(author_id))
+            channel = getattr(getattr(member, "voice", None), "channel", None)
+            return int(channel.id) if channel is not None else None
+        except Exception as exc:
+            self.ui.event(
+                f"STREAM | could not resolve command author's voice channel ({type(exc).__name__})",
+                "yellow",
+            )
+            return None
+
+    async def start_stream_listener(self):
+        if not self.stream_token or self.stream_token.startswith("YOUR_"):
+            self.ui.event(
+                "STREAM | ? command listener disabled; set STREAM_DISCORD_TOKEN to a distinct account.",
+                "yellow",
+            )
+            return
+        self.stream_starting = True
+        try:
+            await self.ensure_stream_runtime()
+            self.ui.event("STREAM | ? command listener is ready.", "green")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("Could not start the stream-token command listener")
+            self.ui.error(exc)
+        finally:
+            self.stream_starting = False
 
     async def get_context(self, origin, *, cls=CommandContext):
         return await super().get_context(origin, cls=cls)
@@ -98,13 +240,16 @@ class MegaPlayBot(commands.Bot):
             await ctx.cleanup_trigger()
 
     async def on_ready(self):
-        self.ui.event(
-            f"Connected as {self.user}. Commands: .download · .status · .help",
-            "bold green",
-        )
+        self.ui.event(f"Connected as {self.user}", "bold green")
         if not self.startup_done:
             self.startup_done = True
             self.scheduler.configure()
+            if self.stream_token and (
+                self.stream_listener_task is None or self.stream_listener_task.done()
+            ):
+                self.stream_listener_task = asyncio.create_task(
+                    self.start_stream_listener(), name="animax-stream-command-listener"
+                )
             if self.cfg.auto_resume:
                 records = [
                     dict(r, id=k)
@@ -196,6 +341,7 @@ class MegaPlayBot(commands.Bot):
             int(record["end"]),
             fixed.id if fixed else anchor.id,
             title=record.get("title", ""),
+            worker_id=int(record.get("worker_id") or 0),
             id=record["id"],
             fallback_notice_sent=bool(record.get("fallback_notice_sent")),
         )
@@ -280,24 +426,29 @@ class MegaPlayBot(commands.Bot):
     async def launch_job(
         self, ctx, target, job, force, *, fixed_target=None, notify=True
     ):
-        if any(
-            task is not None and not task.done()
-            for task in (self.reset_task, self.refetch_task)
-        ):
-            await ctx.send("A history maintenance task is still running.")
+        blocked = None
+        accepted = False
+        async with self.activity_lock:
+            if any(
+                task is not None and not task.done()
+                for task in (self.reset_task, self.refetch_task)
+            ):
+                blocked = "A history maintenance task is still running."
+            elif fixed_target is None and (
+                not getattr(target, "guild", None) or isinstance(target, discord.Thread)
+            ):
+                blocked = "Choose a server text log channel; a saved or manually mentioned upload channel is required."
+            else:
+                self.reset_request = None
+                log_ctx = (
+                    ctx if isinstance(ctx, LogContext) else LogContext(target, ctx)
+                )
+                accepted = self.scheduler.enqueue(
+                    Entry(log_ctx, target, job, force, fixed_target)
+                )
+        if blocked:
+            await ctx.send(blocked)
             return False
-        if fixed_target is None and (
-            not getattr(target, "guild", None) or isinstance(target, discord.Thread)
-        ):
-            await ctx.send(
-                "Choose a server text log channel; a saved or manually mentioned upload channel is required."
-            )
-            return False
-        self.reset_request = None
-        log_ctx = ctx if isinstance(ctx, LogContext) else LogContext(target, ctx)
-        accepted = self.scheduler.enqueue(
-            Entry(log_ctx, target, job, force, fixed_target)
-        )
         if accepted:
             self.job = job
             if notify:
@@ -366,8 +517,7 @@ class MegaPlayBot(commands.Bot):
             title_provisional=provisional_title(job.title, job.mal),
         )
         log.info(
-            "WORKER_TITLE worker=W%s job=%s mal=%s source=%s title=%s",
-            job.worker_id,
+            "DOWNLOAD_TITLE job=%s mal=%s source=%s title=%s",
             job.id,
             job.mal,
             title_source,
@@ -375,8 +525,7 @@ class MegaPlayBot(commands.Bot):
         )
         if title_source == "MAL ID fallback":
             self.ui.event(
-                f"W{job.worker_id} | Title service unavailable; continuing as MAL {job.mal}",
-                "yellow",
+                f"Title service unavailable; continuing as MAL {job.mal}", "yellow"
             )
         self.phase(job, "Preparing upload channel")
         target = entry.fixed_target or await self.router.resolve(entry.anchor, job)
@@ -579,10 +728,8 @@ class MegaPlayBot(commands.Bot):
             if reason == "dub captions unavailable"
             else "Dub unavailable"
         )
-        prefix = f"W{job.worker_id} | " if job.worker_id else ""
         message = (
-            f"{prefix}{job.title} E{episode}: {cause}; "
-            "falling back to sub without captions."
+            f"{job.title} E{episode}: {cause}; falling back to sub without captions."
         )
         job.fallback_notice_sent = True
         with contextlib.suppress(Exception):
@@ -652,7 +799,7 @@ class MegaPlayBot(commands.Bot):
                         save=False,
                     )
             self.library.save()
-            self.ui.start(job.title, key=job.id, worker_id=job.worker_id)
+            self.ui.start(job.title, key=job.id)
             for episode in range(job.start, job.end + 1):
                 job.current = episode
                 job.output_size_bytes = None
@@ -1155,16 +1302,18 @@ class MegaPlayBot(commands.Bot):
     async def close(self):
         self.shutting_down = True
         await self.scheduler.close()
-        if self.worker and not self.worker.done():
-            self.worker.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.worker
         if self.refetch_task and not self.refetch_task.done():
             self.refetch_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.refetch_task
         if self.reset_task and not self.reset_task.done():
             await asyncio.shield(self.reset_task)
+        if self.stream_listener_task and not self.stream_listener_task.done():
+            self.stream_listener_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.stream_listener_task
+        if self.stream_runtime:
+            await self.stream_runtime.close()
         self.ui.finish()
         await super().close()
 
@@ -1218,13 +1367,12 @@ def main():
     load_dotenv(ROOT / ".env")
     setup_logging(ROOT)
     ui = Terminal()
-    ui.banner()
     try:
         dependency_report()
         token = os.getenv("DISCORD_TOKEN", "").strip()
-        if not token or token == "YOUR_USER_TOKEN_HERE":
+        if not token or token.startswith("YOUR_"):
             raise ValueError(
-                "Set DISCORD_TOKEN locally in .env before starting. Do not share it."
+                "Set the main user's DISCORD_TOKEN locally in .env before starting. Do not share it."
             )
         cfg = Settings.from_env(ROOT / "settings.json")
         with InstanceLock(ROOT / ".animax.lock"):
@@ -1232,7 +1380,7 @@ def main():
 
             recover_resets(ROOT)
             library = Library(ROOT / "anime.json")
-            bot = MegaPlayBot(cfg, library, ui)
+            bot = MegaPlayBot(cfg, library, ui, token)
             asyncio.run(run_client(bot, token))
     except (ValueError, discord.LoginFailure) as exc:
         log.exception("Configuration or login failed")

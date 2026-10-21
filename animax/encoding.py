@@ -9,6 +9,13 @@ CAPTION_FONTS = {
     "dejavu-mono": "DejaVu Sans Mono",
 }
 
+FONT_FILES = {
+    "liberation": "LiberationSans-Regular.ttf",
+    "dejavu": "DejaVuSans.ttf",
+    "dejavu-serif": "DejaVuSerif.ttf",
+    "dejavu-mono": "DejaVuSansMono.ttf",
+}
+
 
 FRAME_RATES = {
     "23.976": "24000/1001",

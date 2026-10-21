@@ -1,4 +1,4 @@
-"""Persistent job queue; bounded active workers with one job per anime at a time."""
+"""Persistent serial job queue; only one download job can run at a time."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass
 
-from .resources import Resources, apply_cpu_budget
+from .resources import Resources
 
 log = logging.getLogger("animax.scheduler")
 
@@ -50,10 +50,7 @@ class Scheduler:
                 self.root, self.bot.cfg, self.bot.phase, self.bot.cdn_cooldown
             )
             if self.bot.startup_done:
-                applied = apply_cpu_budget(self.resources.plan.encoder_threads)
-                self.bot.ui.event(
-                    f"Resource plan: {self.resources.plan.data()} | CPU affinity applied: {applied}"
-                )
+                self.bot.ui.event(f"Serial download plan: {self.resources.plan.data()}")
 
     def enqueue(self, entry):
         if self.closing or self.contains(entry.job.id):
@@ -79,7 +76,6 @@ class Scheduler:
             route_version=2,
             routed=entry.fixed_target is not None,
             fallback_notice_sent=job.fallback_notice_sent,
-            worker_id=None,
         )
         self.queue.append(entry)
         self.event.set()
@@ -92,9 +88,7 @@ class Scheduler:
             while not self.closing and (self.queue or self.active):
                 self.event.clear()
                 self.blocked = ""
-                while (
-                    self.queue and len(self.active) < self.resources.plan.active_workers
-                ):
+                while self.queue and len(self.active) < self.resources.plan.active_jobs:
                     occupied_anime = {e.job.mal for e in self.active.values()}
                     entry = next(
                         (e for e in self.queue if e.job.mal not in occupied_anime), None
@@ -110,27 +104,20 @@ class Scheduler:
                         )
                     if self.blocked:
                         break
-                    worker = next(
-                        i
-                        for i in range(1, self.resources.plan.active_workers + 1)
-                        if i not in self.active
-                    )
+                    slot = 1  # Fixed single-job slot; no worker pool in v2.4.3.
                     try:
-                        self.bot.library.job(
-                            entry.job.id, status="running", worker_id=worker
-                        )
+                        self.bot.library.job(entry.job.id, status="running")
                     except OSError:
                         self.blocked = "Cannot save the job journal; admission paused"
                         log.exception(self.blocked)
                         break
                     self.queue.remove(entry)
-                    entry.job.worker_id = worker
-                    self.active[worker] = entry
-                    self.tasks[worker] = asyncio.create_task(
-                        self._run(worker, entry), name=f"ANIMAX W{worker}"
+                    self.active[slot] = entry
+                    self.tasks[slot] = asyncio.create_task(
+                        self._run(slot, entry), name="ANIMAX download job"
                     )
-                    self.tasks[worker].add_done_callback(
-                        lambda task, w=worker, e=entry: self._finished(w, e, task)
+                    self.tasks[slot].add_done_callback(
+                        lambda task, s=slot, e=entry: self._finished(s, e, task)
                     )
                 if not self.queue and not self.active:
                     break
@@ -141,10 +128,10 @@ class Scheduler:
         finally:
             self.dispatcher = None
 
-    def _finished(self, worker, entry, task):
-        if self.tasks.get(worker) is task:
-            self.active.pop(worker, None)
-            self.tasks.pop(worker, None)
+    def _finished(self, slot, entry, task):
+        if self.tasks.get(slot) is task:
+            self.active.pop(slot, None)
+            self.tasks.pop(slot, None)
             if task.cancelled():
                 with contextlib.suppress(OSError):
                     self.bot.library.job(
@@ -153,9 +140,9 @@ class Scheduler:
                     )
             self.event.set()
         if not task.cancelled() and task.exception():
-            log.error("Worker cleanup failed", exc_info=task.exception())
+            log.error("Download job cleanup failed", exc_info=task.exception())
 
-    async def _run(self, worker, entry):
+    async def _run(self, slot, entry):
         try:
             await self.bot.run_managed_job(entry)
         except asyncio.CancelledError:
@@ -166,9 +153,7 @@ class Scheduler:
                 )
             raise
         except Exception as exc:
-            log.exception(
-                "Worker %s failed before starting its episode pipeline", worker
-            )
+            log.exception("Download job setup failed before its episode pipeline")
             with contextlib.suppress(OSError):
                 self.bot.library.job(
                     entry.job.id, status="failed", title=entry.job.title
@@ -177,17 +162,17 @@ class Scheduler:
             entry.job.error = (
                 str(exc)[:260]
                 if isinstance(exc, ValueError)
-                else "Worker setup failed; see logs/bot.log."
+                else "Download job setup failed; see logs/bot.log."
             )
             with contextlib.suppress(Exception):
                 await entry.ctx.send(entry.job.episode_text())
             self.bot.ui.event(
-                f"W{worker} | Job {entry.job.id} setup failed. See logs/bot.log", "red"
+                f"Job {entry.job.id} setup failed. See logs/bot.log", "red"
             )
         finally:
             self.bot.ui.finish(entry.job.id)
-            self.active.pop(worker, None)
-            self.tasks.pop(worker, None)
+            self.active.pop(slot, None)
+            self.tasks.pop(slot, None)
             self.event.set()
 
     def status_text(self):
@@ -196,7 +181,7 @@ class Scheduler:
             for _, e in sorted(self.active.items())
         ]
         lines.append(
-            f"Queued: {len(self.queue)} | Active limit: {self.resources.plan.active_workers} | Shared encode threads: {self.resources.plan.encoder_threads}"
+            f"Queued: {len(self.queue)} download jobs | Concurrent download jobs: 1 (fixed) | Shared encode threads: {self.resources.plan.encoder_threads}"
         )
         if self.blocked:
             lines.append(self.blocked)
@@ -210,27 +195,27 @@ class Scheduler:
         selector = selector.strip().lower()
         if not selector:
             if len(self.active) == 1:
-                selector = f"w{next(iter(self.active))}"
+                selector = next(iter(self.active.values())).job.id
             elif not self.active and len(self.queue) == 1:
                 selector = self.queue[0].job.id
             else:
-                return "Use `.cancel W1`, `.cancel JOB_ID` or `.cancel all`."
+                return "Use `.cancel JOB_ID` or `.cancel all`."
         selected = [
-            (w, e)
-            for w, e in self.active.items()
-            if selector in {"all", f"w{w}", e.job.id}
+            (slot, entry)
+            for slot, entry in self.active.items()
+            if selector in {"all", entry.job.id}
         ]
         queued = [e for e in self.queue if selector in {"all", e.job.id}]
         for entry in queued:
             self.bot.library.job(entry.job.id, status="cancelled")
             self.queue.remove(entry)
-        tasks = [self.tasks[w] for w, _ in selected]
+        tasks = [self.tasks[slot] for slot, _ in selected]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self.event.set()
-        return f"Cancelled {len(tasks)} active and {len(queued)} queued jobs. History and cached videos were kept."
+        return f"Cancelled {len(tasks)} active and {len(queued)} queued download jobs. History and cached videos were kept."
 
     async def close(self):
         self.closing = True

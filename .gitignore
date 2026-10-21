@@ -20,6 +20,7 @@ downloads/
 .reset-pending-*/
 
 # Local dependencies and generated output
+node_modules/
 .venv/
 .browsers/
 __pycache__/

@@ -112,26 +112,17 @@ class Terminal:
         self.tasks = {}
         self.last = {}
 
-    def banner(self):
-        self.console.print(
-            Text(
-                "ANIMAX 2.4.2  |  .help for commands  |  Ctrl+C saves progress",
-                style="bold cyan",
-            )
-        )
-
     def event(self, message, style="cyan"):
         self.console.print(
             Text(f"[{time.strftime('%H:%M:%S')}] {message}", style=style)
         )
 
-    def start(self, title, key="default", worker_id=0):
+    def start(self, title, key="default"):
         self.finish(key)
         self.progress.start()
+        timestamp = time.strftime("%H:%M:%S")
         self.tasks[key] = self.progress.add_task(
-            f"W{worker_id} : {title}" if worker_id else title,
-            total=100,
-            label="Resolving",
+            f"[{timestamp}] {title}", total=100, label="Resolving"
         )
 
     def update(self, job):
@@ -159,11 +150,11 @@ class Terminal:
                 if speed:
                     label += f" | {speed / 1024**2:.2f} MiB/s"
         task = self.tasks.get(job.id, self.tasks.get("default"))
-        prefix = f"W{job.worker_id} : " if job.worker_id else ""
         if task is not None:
+            timestamp = time.strftime("%H:%M:%S")
             self.progress.update(
                 task,
-                description=f"{prefix}E{job.current} | {job.title[:32]}",
+                description=f"[{timestamp}] E{job.current} | {job.title[:32]}",
                 completed=percent or 0,
                 label=label,
             )
@@ -171,7 +162,7 @@ class Terminal:
             bucket = int((percent or 0) // 10)
             last_stage, last_bucket = self.last.get(job.id, (None, -1))
             if job.phase != last_stage or bucket > last_bucket:
-                self.event(f"{prefix}{job.title} | E{job.current} | {label}")
+                self.event(f"{job.title} | E{job.current} | {label}")
                 self.last[job.id] = job.phase, bucket
 
     def error(self, exc, log_name="logs/bot.log"):
